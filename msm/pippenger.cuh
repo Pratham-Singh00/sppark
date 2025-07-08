@@ -15,6 +15,8 @@
 #include "sort.cuh"
 #include "batch_addition.cuh"
 
+#include <cuda_runtime.h> //added later by us 
+
 #ifndef WARP_SZ
 # define WARP_SZ 32
 #endif
@@ -329,6 +331,7 @@ class msm_t {
     const gpu_t& gpu;
     size_t npoints;
     uint32_t wbits, nwins;
+    uint8_t* d_blob_managed;
     bucket_h *d_buckets;
     affine_h *d_points;
     scalar_t *d_scalars;
@@ -371,12 +374,27 @@ public:
         size_t d_blob_sz = (d_buckets_sz * sizeof(d_buckets[0]))
                          + (nwins * row_sz * sizeof(uint32_t))
                          + (points ? npoints * sizeof(d_points[0]) : 0);
-
+        
+        //Constructor without allowing the use of unifed memory  
+        /*
         d_buckets = reinterpret_cast<decltype(d_buckets)>(gpu.Dmalloc(d_blob_sz));
         d_hist = vec2d_t<uint32_t>(&d_buckets[d_buckets_sz], row_sz);
         if (points) {
             d_points = reinterpret_cast<decltype(d_points)>(d_hist[nwins]);
             gpu.HtoD(d_points, points, np, ffi_affine_sz);
+            npoints = np;
+        */
+
+        //allocating the blob in the unifed memory 
+        this->d_blob_managed = nullptr;
+        cudaMallocManaged(&this->d_blob_managed, d_blob_sz);
+        d_buckets = reinterpret_cast<decltype(d_buckets)>(this->d_blob_managed);
+
+        d_hist = vec2d_t<uint32_t>(&d_buckets[d_buckets_sz], row_sz);
+        if (points) {
+            d_points = reinterpret_cast<decltype(d_points)>(d_hist[nwins]);
+            //implementing the cudaMemcpy for the unifed memory instead of explict gpu host to device copy method created
+            memcpy(d_points, points, np * ffi_affine_sz);
             npoints = np;
         } else {
             npoints = 0;
@@ -391,7 +409,7 @@ public:
     ~msm_t()
     {
         gpu.sync();
-        if (d_buckets) gpu.Dfree(d_buckets);
+        if (this->d_blob_managed) cudaFree(this->d_blob_managed);
     }
 
 private:
@@ -408,10 +426,16 @@ private:
         uint32_t grid_size = gpu.sm_count() / 3;
         while (grid_size & (grid_size - 1))
             grid_size -= (grid_size & (0 - grid_size));
-
+        /*
         breakdown<<<2*grid_size, 1024, sizeof(scalar_t)*1024, gpu[2]>>>(
             d_digits, d_scalars, len, nwins, wbits, mont
         );
+        */
+
+        breakdown<<<32, 1024, sizeof(scalar_t)*1024, gpu[2]>>>( //changed the grid size to 32 for the jetson specifics 
+            d_digits, d_scalars, len, nwins, wbits, mont
+        );
+
         CUDA_OK(cudaGetLastError());
 
         const size_t shared_sz = sizeof(uint32_t) << DIGIT_BITS;
@@ -464,6 +488,8 @@ public:
         out.inf();
         point_t p;
 
+        uint8_t *d_temp = nullptr;
+
         try {
             // |scalars| being nullptr means the scalars are pre-loaded to
             // |d_scalars|, otherwise allocate stride.
@@ -478,7 +504,9 @@ public:
 
             size_t digits_sz = nwins * stride * sizeof(uint32_t);
 
-            dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
+            //dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]}; changing temporary allocation 
+
+            cudaMallocManaged(&d_temp, temp_sz + digits_sz + d_point_sz);
 
             vec2d_t<uint2> d_temps{&d_temp[0], stride};
             vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
@@ -493,14 +521,20 @@ public:
             size_t num = stride > npoints ? npoints : stride;
             event_t ev;
 
-            if (scalars)
-                gpu[2].HtoD(&d_scalars[d_off], &scalars[h_off], num);
+            if (scalars){
+                //gpu[2].HtoD(&d_scalars[d_off], &scalars[h_off], num);
+                memcpy(&d_scalars[d_off], &scalars[h_off], num * sizeof(scalar_t));
+            }
             digits(&d_scalars[0], num, d_digits, d_temps, mont);
             gpu[2].record(ev);
 
             if (points)
+                /*
                 gpu[0].HtoD(&d_points[d_off], &points[h_off],
                             num,              ffi_affine_sz);
+                */
+                memcpy(&d_points[d_off], &points[h_off*ffi_affine_sz],
+                       num * ffi_affine_sz);
 
             for (uint32_t i = 0; i < batch; i++) {
                 gpu[i&1].wait(ev);
@@ -530,7 +564,8 @@ public:
                     num = h_off + stride <= npoints ? stride : npoints - h_off;
 
                     if (scalars)
-                        gpu[2].HtoD(&d_scalars[0], &scalars[h_off], num);
+                        //gpu[2].HtoD(&d_scalars[0], &scalars[h_off], num);
+                        memcpy(&d_scalars[0], &scalars[h_off], num * sizeof(scalar_t));
                     gpu[2].wait(ev);
                     digits(&d_scalars[scalars ? 0 : h_off], num,
                            d_digits, d_temps, mont);
@@ -539,23 +574,33 @@ public:
                     if (points) {
                         size_t j = (i + 1) & 1;
                         d_off = j ? stride : 0;
+                        /*
                         gpu[j].HtoD(&d_points[d_off], &points[h_off*ffi_affine_sz],
                                     num,              ffi_affine_sz);
+                        */
+                        memcpy(&d_points[d_off], points + h_off*ffi_affine_sz,
+                            num * ffi_affine_sz);
                     } else {
                         d_off = h_off;
                     }
                 }
 
+                gpu[i&1].sync(); // wait for the previous kernel to finish
+
                 if (i > 0) {
                     collect(p, res, ones);
                     out.add(p);
                 }
-
+                /*
                 gpu[i&1].DtoH(ones, d_buckets + (nwins << (wbits-1)));
                 gpu[i&1].DtoH(res, d_buckets, sizeof(bucket_h)<<(wbits-1));
                 gpu[i&1].sync();
+                */
+                memcpy(ones.data(), d_buckets + (nwins << (wbits-1)), ones.size() * sizeof(bucket_t));
+                memcpy(res.data(), d_buckets, res.size() * sizeof(result_t));
             }
         } catch (const cuda_error& e) {
+            cudaFree(d_temp);
             gpu.sync();
 #ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
             return RustError{e.code(), e.what()};
@@ -566,6 +611,8 @@ public:
 
         collect(p, res, ones);
         out.add(p);
+
+        cudaFree(d_temp);
 
         return RustError{cudaSuccess};
     }
@@ -732,6 +779,7 @@ RustError mult_pippenger(point_t *out, const affine_t points[], size_t npoints,
                                        const scalar_t scalars[], bool mont = true,
                                        size_t ffi_affine_sz = sizeof(affine_t))
 {
+    // printf("running locally\n");
     try {
         msm_t<bucket_t, point_t, affine_t, scalar_t> msm{nullptr, npoints};
         return msm.invoke(*out, slice_t<affine_t>{points, npoints},
