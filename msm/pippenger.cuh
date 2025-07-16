@@ -123,10 +123,10 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 #ifndef LARGE_L1_CODE_CACHE
 # if __CUDA_ARCH__-0 >= 800
 #  define LARGE_L1_CODE_CACHE 1
-#  define ACCUMULATE_NTHREADS 384
+#  define ACCUMULATE_NTHREADS 512
 # else
 #  define LARGE_L1_CODE_CACHE 0
-#  define ACCUMULATE_NTHREADS (bucket_t::degree == 1 ? 384 : 256)
+#  define ACCUMULATE_NTHREADS (bucket_t::degree == 1 ? 512 : 256)
 # endif
 #endif
 
@@ -222,77 +222,59 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
         current = 0;
 }
 
-template<class bucket_t, class bucket_h = class bucket_t::mem_t>
+template<class bucket_t, class bucket_h = typename bucket_t::mem_t>
 __launch_bounds__(256) __global__
-void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbits)
-{
-    const uint32_t degree = bucket_t::degree;
-    uint32_t Nthrbits = 31 - __clz(blockDim.x / degree);
+void integrate(
+    bucket_h * __restrict__ buckets_, 
+    uint32_t    nwins, 
+    uint32_t    wbits, 
+    uint32_t    nbits
+) {
+    const uint32_t degree    = bucket_t::degree;
+    const uint32_t tid       = threadIdx.x / degree;   
+    const uint32_t bid       = blockIdx.x;
+    const uint32_t cwbits    = wbits - 1;
+    const uint32_t row_len   = 1u << cwbits;            
 
-    assert((blockDim.x & (blockDim.x-1)) == 0 && wbits-1 > Nthrbits);
+    struct pair_t { bucket_h lo, hi; };
+    pair_t *row = reinterpret_cast<pair_t*>(buckets_ + bid * row_len);
 
-    vec2d_t<bucket_h> buckets{buckets_, 1U<<(wbits-1)};
-    extern __shared__ uint4 scratch_[];
-    auto* scratch = reinterpret_cast<bucket_h*>(scratch_);
-    const uint32_t tid = threadIdx.x / degree;
-    const uint32_t bid = blockIdx.x;
+    pair_t data = row[tid];
 
-    auto* row = &buckets[bid][0];
-    uint32_t i = 1U << (wbits-1-Nthrbits);
-    row += tid * i;
+    bucket_t low  = data.lo;
+    bucket_t high = data.hi;
 
     uint32_t mask = 0;
-    if ((bid+1)*wbits > nbits) {
-        uint32_t lsbits = nbits - bid*wbits;
-        mask = (1U << (wbits-lsbits)) - 1;
+    if ((bid + 1) * wbits > nbits) {
+        uint32_t ls = nbits - bid * wbits;
+        mask = (1u << (wbits - ls)) - 1;
     }
 
-    bucket_t res, acc = row[--i];
-
-    if (i & mask) {
-        if (sizeof(res) <= 128) res.inf();
-        else                    scratch[tid].inf();
+    bucket_t res, acc = high;
+    if (((tid*2 + 1) & mask) == 0) {
+        res = acc;
     } else {
-        if (sizeof(res) <= 128) res = acc;
-        else                    scratch[tid] = acc;
+        res.inf();
     }
 
-    bucket_t p;
-
-    #pragma unroll 1
-    while (i--) {
-        p = row[i];
-
-        uint32_t pc = i & mask ? 2 : 0;
-        #pragma unroll 1
-        do {
-            if (sizeof(bucket_t) <= 128) {
-                p.add(acc);
-                if (pc == 1) {
-                    res = p;
-                } else {
-                    acc = p;
-                    if (pc == 0) p = res;
-                }
-            } else {
-                if (LARGE_L1_CODE_CACHE && degree == 1)
-                    p.add(acc);
-                else
-                    p.uadd(acc);
-                if (pc == 1) {
-                    scratch[tid] = p;
-                } else {
-                    acc = p;
-                    if (pc == 0) p = scratch[tid];
-                }
-            }
-        } while (++pc < 2);
+    bucket_t p = low;
+    if (sizeof(bucket_t) <= 128 || LARGE_L1_CODE_CACHE) {
+        p.add(acc);
+    } else {
+        p.uadd(acc);
     }
 
-    __syncthreads();
+    uint32_t pc = ((tid*2) & mask) ? 2 : 0;
+    if (pc == 0) {
+        acc = p;
+        p   = res;
+    } else if (pc == 1) {
+        res = p;
+    }
 
-    buckets[bid][2*tid] = p;
-    buckets[bid][2*tid+1] = acc;
+    data.lo = p;
+    data.hi = acc;
+    row[tid] = data;
 }
 #undef asm
 

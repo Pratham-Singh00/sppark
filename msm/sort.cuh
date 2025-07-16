@@ -11,7 +11,7 @@
 
 #define SORT_BLOCKDIM 1024
 #ifndef DIGIT_BITS
-# define DIGIT_BITS 13
+# define DIGIT_BITS 11
 #endif
 #if DIGIT_BITS < 10 || DIGIT_BITS > 14
 # error "impossible DIGIT_BITS"

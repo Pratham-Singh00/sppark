@@ -13,9 +13,9 @@
 
 #ifndef WARP_SZ
 # define WARP_SZ 32
-#endif
-
-#define BATCH_ADD_BLOCK_SIZE 256
+#endif 
+#define TILE_SIZE 512
+#define BATCH_ADD_BLOCK_SIZE 384
 #ifndef BATCH_ADD_NSTREAMS
 # define BATCH_ADD_NSTREAMS 8
 #elif BATCH_ADD_NSTREAMS == 0
@@ -146,14 +146,31 @@ void batch_addition(bucket_h ret[], const affine_h points[], size_t npoints,
     bucket_t acc;
     acc.inf();
 
-    for (size_t i = tid; i < ndigits; i += gridDim.x*blockDim.x/degree) {
+    __shared__ affine_t point_tile[TILE_SIZE];
+
+   int tids = threadIdx.x + blockIdx.x * blockDim.x;
+
+    for (size_t tile_start = 0; tile_start < ndigits; tile_start += TILE_SIZE) {
+    if (threadIdx.x < TILE_SIZE && tile_start + threadIdx.x < ndigits) {
+        uint32_t digit = digits[tile_start + threadIdx.x];
+        point_tile[threadIdx.x] = points[digit & 0x7fffffff];
+    }
+
+    __syncthreads();
+
+    for (size_t i = tile_start + tids; i < tile_start + TILE_SIZE && i < ndigits; i += gridDim.x * blockDim.x / degree) {
         uint32_t digit = digits[i];
-        affine_t p = points[digit & 0x7fffffff];
+        affine_t p = point_tile[i - tile_start];
+
         if (degree == 2)
             acc.uadd(p, digit >> 31);
         else
             acc.add(p, digit >> 31);
     }
+
+    __syncthreads();
+}
+
 
     for (uint32_t off = 1; off < warp_sz;) {
         auto down = shfl_down(acc, off*degree);
