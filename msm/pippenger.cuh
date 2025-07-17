@@ -132,6 +132,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 
 #ifndef MSM_NTHREADS
 # define MSM_NTHREADS 256
+# define COARSENING_FACTOR 4
 #endif
 #if MSM_NTHREADS < 32 || (MSM_NTHREADS & (MSM_NTHREADS-1)) != 0
 # error "bad MSM_NTHREADS value"
@@ -144,82 +145,88 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 
 template<class bucket_t,
          class affine_h,
-         class bucket_h = class bucket_t::mem_t,
-         class affine_t = class bucket_t::affine_t>
-__launch_bounds__(ACCUMULATE_NTHREADS) __global__
-void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
-                /*const*/ affine_h points_[], const vec2d_t<uint32_t> digits,
-                const vec2d_t<uint32_t> histogram, uint32_t sid = 0)
+         class bucket_h = typename bucket_t::mem_t,
+         class affine_t = typename bucket_t::affine_t>
+__launch_bounds__(ACCUMULATE_NTHREADS)
+__global__ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
+                           /*const*/ affine_h points_[], const vec2d_t<uint32_t> digits,
+                           const vec2d_t<uint32_t> histogram, uint32_t sid = 0)
 {
-    vec2d_t<bucket_h> buckets{buckets_, 1U<<--wbits};
+
+    vec2d_t<bucket_h> buckets{buckets_, 1U << --wbits};
     const affine_h* points = points_;
 
     static __device__ uint32_t streams[MSM_NSTREAMS];
     uint32_t& current = streams[sid % MSM_NSTREAMS];
     uint32_t laneid;
     asm("mov.u32 %0, %laneid;" : "=r"(laneid));
+
     const uint32_t degree = bucket_t::degree;
     const uint32_t warp_sz = WARP_SZ / degree;
     const uint32_t lane_id = laneid / degree;
 
-    uint32_t x, y;
-#if 1
-    __shared__ uint32_t xchg;
+    uint32_t base_x;
 
-    if (threadIdx.x == 0)
-        xchg = atomicAdd(&current, blockDim.x/degree);
-    __syncthreads();
-    x = xchg + threadIdx.x/degree;
-#else
-    x = laneid == 0 ? atomicAdd(&current, warp_sz) : 0;
-    x = __shfl_sync(0xffffffff, x, 0) + lane_id;
-#endif
+    if (laneid == 0) {
+        base_x = atomicAdd(&current, warp_sz * COARSENING_FACTOR);
+    }
+    base_x = __shfl_sync(0xffffffff, base_x, 0) + lane_id * COARSENING_FACTOR;
 
-    while (x < (nwins << wbits)) {
-        y = x >> wbits;
-        x &= (1U << wbits) - 1;
-        const uint32_t* h = &histogram[y][x];
+    while (base_x < (nwins << wbits)) {
+        #pragma unroll
+        for (int i = 0; i < COARSENING_FACTOR; i++) {
+            uint32_t x = base_x + i;
+            if (x >= (nwins << wbits)) {
+            break;
+            }
+            uint32_t y = x >> wbits;
+            uint32_t bx = x & ((1U << wbits) - 1);
+            const uint32_t* h = &histogram[y][bx];
 
-        uint32_t idx, len = h[0];
+            uint32_t idx, len = h[0];
 
-        asm("{ .reg.pred %did;"
-            "  shfl.sync.up.b32 %0|%did, %1, %2, 0, 0xffffffff;"
-            "  @!%did mov.b32 %0, 0;"
-            "}" : "=r"(idx) : "r"(len), "r"(degree));
+            asm("{ .reg.pred %did;"
+                "  shfl.sync.up.b32 %0|%did, %1, %2, 0, 0xffffffff;"
+                "  @!%did mov.b32 %0, 0;"
+                "}" : "=r"(idx) : "r"(len), "r"(degree));
 
-        if (lane_id == 0 && x != 0)
-            idx = h[-1];
-
-        if ((len -= idx) && !(x == 0 && y == 0)) {
-            const uint32_t* digs_ptr = &digits[y][idx];
-            uint32_t digit = *digs_ptr++;
-
-            affine_t p = points[digit & 0x7fffffff];
-            bucket_t bucket = p;
-            bucket.cneg(digit >> 31);
-
-            while (--len) {
-                digit = *digs_ptr++;
-                p = points[digit & 0x7fffffff];
-                if (sizeof(bucket) <= 128 || LARGE_L1_CODE_CACHE)
-                    bucket.add(p, digit >> 31);
-                else
-                    bucket.uadd(p, digit >> 31);
+            if (lane_id == 0 && bx != 0) {
+                idx = h[-1];
             }
 
-            buckets[y][x] = bucket;
-        } else {
-            buckets[y][x].inf();
-        }
+            if ((len -= idx) && !(bx == 0 && y == 0)) {
+                const uint32_t* digs_ptr = &digits[y][idx];
+                uint32_t digit = *digs_ptr++;
 
-        x = laneid == 0 ? atomicAdd(&current, warp_sz) : 0;
-        x = __shfl_sync(0xffffffff, x, 0) + lane_id;
+                affine_t p = points[digit & 0x7fffffff];
+                bucket_t bucket = p;
+                bucket.cneg(digit >> 31);
+
+                while (--len) {
+                    digit = *digs_ptr++;
+                    p = points[digit & 0x7fffffff];
+                    if (sizeof(bucket) <= 128 || LARGE_L1_CODE_CACHE)
+                        bucket.add(p, digit >> 31);
+                    else
+                        bucket.uadd(p, digit >> 31);
+                }
+
+                buckets[y][bx] = bucket;
+            } else {
+                buckets[y][bx].inf();
+            }
+        }
+        if (laneid == 0) {
+            base_x = atomicAdd(&current, warp_sz * COARSENING_FACTOR);
+        }
+        base_x = __shfl_sync(0xffffffff, base_x, 0) + lane_id * COARSENING_FACTOR;
     }
 
     cooperative_groups::this_grid().sync();
 
-    if (threadIdx.x + blockIdx.x == 0)
+    if (threadIdx.x + blockIdx.x == 0) {
         current = 0;
+    }
 }
 
 template<class bucket_t, class bucket_h = class bucket_t::mem_t>
