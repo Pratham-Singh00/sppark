@@ -43,17 +43,17 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
     uint32_t laneid;
     asm("mov.u32 %0, %laneid;" : "=r"(laneid));
 
-    bucket_t accs[COARSENING_FACTOR];
+    bucket_t combine[COARSENING_FACTOR];
     #pragma unroll
     for (int i = 0; i < COARSENING_FACTOR; i++) {
-        accs[i].inf();
-        }
+        combine[i].inf();
+    }
 
     if (accumulate && tid < gridDim.x*blockDim.x/WARP_SZ) {
         #pragma unroll
         for (int i = 0; i < COARSENING_FACTOR; i++) {
-            accs[i] = ret[tid];
-            }
+            combine[i] = ret[tid];
+        }
     }
 
     uint32_t base = laneid == 0 ? atomicAdd(&current, 32*WARP_SZ) : 0;
@@ -73,11 +73,12 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
         }
 
         for (; i < chunk && j < warp_sz; i++) {
-            if (i % 32 == 0)
+            if (i % 32 == 0) {
                 word = __shfl_sync(0xffffffff, bits, i/32);
-            if (refmap && (i % 32 == 0))
+            }
+            if (refmap && (i % 32 == 0)) {
                 sign = __shfl_sync(0xffffffff, refs, i/32);
-
+            }
             if (word & 1) {
                 #pragma unroll
                 for (int c = 0; c < COARSENING_FACTOR; c++) {
@@ -104,10 +105,10 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
                 if (offs[c] != 0xffffffff) {
                     affine_t p = points[offs[c] & 0x7fffffff];
                     if (degree == 2) {
-                        accs[c].uadd(p, offs[c] >> 31);
+                        combine[c].uadd(p, offs[c] >> 31);
                     } else {
-                        accs[c].add(p, offs[c] >> 31);
-                        }
+                        combine[c].add(p, offs[c] >> 31);
+                     }
                     offs[c] = 0xffffffff;
                 }
             }
@@ -115,29 +116,29 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
         }
     }
 
-    bucket_t acc = accs[0];
+    bucket_t full_value = combine[0];
     #pragma unroll
     for (int i = 1; i < COARSENING_FACTOR; i++) {
-        acc.uadd(accs[i]);
-        }
+        full_value.uadd(combine[i]);
+    }
 
     for (uint32_t off = 1; off < warp_sz * COARSENING_FACTOR;) {
-        auto down = shfl_down(acc, off * degree);
+        auto down = shfl_down(full_value, off * degree);
         off <<= 1;
         if (((xid_base / COARSENING_FACTOR) & (off - 1)) == 0) {
-            acc.uadd(down);
+            full_value.uadd(down);
            }
     }
 
     cooperative_groups::this_grid().sync();
 
     if ((xid_base / COARSENING_FACTOR) == 0) {
-        ret[tid / (warp_sz * COARSENING_FACTOR)] = acc;
-        }
+        ret[tid / (warp_sz * COARSENING_FACTOR)] = full_value;
+    }
 
     if (threadIdx.x + blockIdx.x == 0) {
         current = 0;
-        }
+    }
 }
 
 template<class bucket_t, class affine_h,
@@ -159,58 +160,60 @@ void batch_diff(bucket_h ret[], const affine_h points[], uint32_t npoints,
 {   add<bucket_t>(ret, points, npoints, bitmap, refmap, accumulate, sid);   }
 
 template<class bucket_t, class affine_h,
-         class bucket_h = class bucket_t::mem_t,
-         class affine_t = class bucket_t::affine_t>
-__launch_bounds__(BATCH_ADD_BLOCK_SIZE) __global__
+         class bucket_h = typename bucket_t::mem_t,
+         class affine_t = typename bucket_t::affine_t>
+__launch_bounds__(BATCH_ADD_BLOCK_SIZE, 2) __global__
 void batch_addition(bucket_h ret[], const affine_h points[], size_t npoints,
                     const uint32_t digits[], const uint32_t& ndigits)
 {
     const uint32_t degree = bucket_t::degree;
     const uint32_t warp_sz = WARP_SZ / degree;
-    const uint32_t tid = (threadIdx.x + blockDim.x*blockIdx.x) / degree;
-    const uint32_t xid = tid % warp_sz;
+    const uint32_t tid = (threadIdx.x + blockDim.x * blockIdx.x) / degree;
+    const uint32_t xid_base = (tid % warp_sz) * COARSENING_FACTOR;
 
-    bucket_t acc;
-    acc.inf();
-
-    __shared__ affine_t point_tile[TILE_SIZE];
-
-   int tids = threadIdx.x + blockIdx.x * blockDim.x;
-
-    for (size_t tile_start = 0; tile_start < ndigits; tile_start += TILE_SIZE) {
-    // Load tile of points into shared memory
-    if (threadIdx.x < TILE_SIZE && tile_start + threadIdx.x < ndigits) {
-        uint32_t digit = digits[tile_start + threadIdx.x];
-        point_tile[threadIdx.x] = points[digit & 0x7fffffff];
+    bucket_t combine[COARSENING_FACTOR];
+    #pragma unroll
+    for (int c = 0; c < COARSENING_FACTOR; c++) {
+        combine[c].inf();
     }
 
-    __syncthreads();
+    size_t global_id = threadIdx.x + blockDim.x * blockIdx.x;
 
-    // Iterate over this tile using thread striding
-    for (size_t i = tile_start + tids; i < tile_start + TILE_SIZE && i < ndigits; i += gridDim.x * blockDim.x / degree) {
+    for (size_t i = global_id; i < ndigits; i += gridDim.x * blockDim.x) {
         uint32_t digit = digits[i];
-        affine_t p = point_tile[i - tile_start];
+        affine_t p = points[digit & 0x7fffffff];
+        uint32_t sign = digit >> 31;
 
-        if (degree == 2)
-            acc.uadd(p, digit >> 31);
-        else
-            acc.add(p, digit >> 31);
+        #pragma unroll
+        for (int c = 0; c < COARSENING_FACTOR; c++) {
+            size_t index = i + c * blockDim.x * gridDim.x;
+            if (index >= ndigits) {
+            continue;
+            }
+            uint32_t digit_c = digits[index];
+            affine_t p_c = points[digit_c & 0x7fffffff];
+            uint32_t sign_c = digit_c >> 31;
+            combine[c].add(p_c, sign_c);
+        }
     }
 
-    __syncthreads();
-}
-
-
-    for (uint32_t off = 1; off < warp_sz;) {
-        auto down = shfl_down(acc, off*degree);
-
+    bucket_t full_value = combine[0];
+    #pragma unroll
+    for (int c = 1; c < COARSENING_FACTOR; c++) {
+        full_value.uadd(combine[c]);
+    }
+    
+    for (uint32_t off = 1; off < warp_sz * COARSENING_FACTOR;) {
+        auto down = shfl_down(full_value, off * degree);
         off <<= 1;
-        if ((xid & (off-1)) == 0)
-            acc.uadd(down); // .add() triggers spills ... in .shfl_down()
+        if (((xid_base / COARSENING_FACTOR) & (off - 1)) == 0) {
+            full_value.uadd(down);
+        }
     }
 
-    if (xid == 0)
-        ret[tid/warp_sz] = acc;
+    if (xid_base == 0) {
+        ret[tid / warp_sz] = full_value;
+    }
 }
 
 template<class bucket_t>
