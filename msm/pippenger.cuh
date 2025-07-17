@@ -131,7 +131,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 #endif
 
 #ifndef MSM_NTHREADS
-# define MSM_NTHREADS 256
+# define MSM_NTHREADS 128
 #endif
 #if MSM_NTHREADS < 32 || (MSM_NTHREADS & (MSM_NTHREADS-1)) != 0
 # error "bad MSM_NTHREADS value"

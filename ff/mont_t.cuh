@@ -1,6 +1,8 @@
 // Copyright Supranational LLC
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
+#include "warp_mul.cuh"
+
 
 #if defined(__CUDA_ARCH__) && !defined(__SPPARK_FF_MONT_T_CUH__)
 # define __SPPARK_FF_MONT_T_CUH__
@@ -399,27 +401,36 @@ private:
     }
 
 public:
+    static inline __device__
+    void montgomery_reduce(uint32_t dst[], const uint64_t prod[8]) {
+        mont_t::wide_t w;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            w.even[2*i + 0] = (uint32_t)prod[i];
+            w.even[2*i + 1] = (uint32_t)(prod[i] >> 32);
+        }
+        mont_t t = w;
+        t.store(dst);
+    }
+    
     friend inline mont_t operator*(const mont_t& a, const mont_t& b)
     {
         if (N%32 == 0) {
             return wide_t{a, b};
         } else {
-            mont_t even, odd;
-
-            #pragma unroll
-            for (size_t i = 0; i < n; i += 2) {
-                mad_n_redc(&even[0], &odd[0], &a[0], b[i], i==0);
-                mad_n_redc(&odd[0], &even[0], &a[0], b[i+1]);
-            }
-
-            // merge |even| and |odd|
-            cadd_n(&even[0], &odd[1], n-1);
-            asm("addc.u32 %0, %0, 0;" : "+r"(even[n-1]));
-
-            even.final_sub(0, &odd[0]);
-
-            return even;
+        uint64_t A64[4], B64[4], prod[8];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          A64[j] = ((uint64_t)a[2*j+1] << 32) | a[2*j+0];
+          B64[j] = ((uint64_t)b[2*j+1] << 32) | b[2*j+0];
         }
+
+        karatsuba4(prod, A64, B64);
+
+        mont_t out;
+        montgomery_reduce(out.even, prod);
+        return out;
+    }
     }
     inline mont_t& operator*=(const mont_t& a)
     {   return *this = *this * a;   }

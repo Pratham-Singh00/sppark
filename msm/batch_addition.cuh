@@ -12,10 +12,11 @@
 #include <ff/shfl.cuh>
 
 #ifndef WARP_SZ
-# define WARP_SZ 32
+# define WARP_SZ 64
 #endif 
 #define TILE_SIZE 512
-#define BATCH_ADD_BLOCK_SIZE 384
+#define BATCH_ADD_BLOCK_SIZE 256
+#define COARSENING_FACTOR 4
 #ifndef BATCH_ADD_NSTREAMS
 # define BATCH_ADD_NSTREAMS 8
 #elif BATCH_ADD_NSTREAMS == 0
@@ -30,28 +31,37 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
                 const uint32_t bitmap[], const uint32_t refmap[],
                 bool accumulate, uint32_t sid)
 {
+
     static __device__ uint32_t streams[BATCH_ADD_NSTREAMS];
     uint32_t& current = streams[sid % BATCH_ADD_NSTREAMS];
 
     const uint32_t degree = bucket_t::degree;
     const uint32_t warp_sz = WARP_SZ / degree;
     const uint32_t tid = (threadIdx.x + blockDim.x*blockIdx.x) / degree;
-    const uint32_t xid = tid % warp_sz;
+    const uint32_t xid_base = (tid % warp_sz) * COARSENING_FACTOR;
 
     uint32_t laneid;
     asm("mov.u32 %0, %laneid;" : "=r"(laneid));
 
-    bucket_t acc;
-    acc.inf();
+    bucket_t accs[COARSENING_FACTOR];
+    #pragma unroll
+    for (int i = 0; i < COARSENING_FACTOR; i++) {
+        accs[i].inf();
+        }
 
-    if (accumulate && tid < gridDim.x*blockDim.x/WARP_SZ)
-        acc = ret[tid];
+    if (accumulate && tid < gridDim.x*blockDim.x/WARP_SZ) {
+        #pragma unroll
+        for (int i = 0; i < COARSENING_FACTOR; i++) {
+            accs[i] = ret[tid];
+            }
+    }
 
     uint32_t base = laneid == 0 ? atomicAdd(&current, 32*WARP_SZ) : 0;
     base = __shfl_sync(0xffffffff, base, 0);
 
-    uint32_t chunk = min(32*WARP_SZ, npoints-base);
-    uint32_t bits, refs, word, sign = 0, off = 0xffffffff;
+    uint32_t chunk = min(32*WARP_SZ, npoints - base);
+    uint32_t bits = 0, refs = 0, word = 0, sign = 0;
+    uint32_t offs[COARSENING_FACTOR] = {0xffffffff, 0xffffffff};
 
     for (uint32_t i = 0, j = 0; base < npoints;) {
         if (i == 0) {
@@ -63,14 +73,19 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
         }
 
         for (; i < chunk && j < warp_sz; i++) {
-            if (i%32 == 0)
+            if (i % 32 == 0)
                 word = __shfl_sync(0xffffffff, bits, i/32);
-            if (refmap && (i%32 == 0))
+            if (refmap && (i % 32 == 0))
                 sign = __shfl_sync(0xffffffff, refs, i/32);
 
             if (word & 1) {
-                if (j++ == xid)
-                    off = (base + i) | (sign << 31);
+                #pragma unroll
+                for (int c = 0; c < COARSENING_FACTOR; c++) {
+                    if (j == xid_base + c) {
+                        offs[c] = (base + i) | (sign << 31);
+                    }
+                }
+                j++;
             }
             word >>= 1;
             sign >>= 1;
@@ -79,38 +94,50 @@ static void add(bucket_h ret[], const affine_h points[], uint32_t npoints,
         if (i == chunk) {
             base = laneid == 0 ? atomicAdd(&current, 32*WARP_SZ) : 0;
             base = __shfl_sync(0xffffffff, base, 0);
-            chunk = min(32*WARP_SZ, npoints-base);
+            chunk = min(32*WARP_SZ, npoints - base);
             i = 0;
         }
 
         if (base >= npoints || j == warp_sz) {
-            if (off != 0xffffffff) {
-                affine_t p = points[off & 0x7fffffff];
-                if (degree == 2)
-                    acc.uadd(p, off >> 31);
-                else
-                    acc.add(p, off >> 31);
-                off = 0xffffffff;
+            #pragma unroll
+            for (int c = 0; c < COARSENING_FACTOR; c++) {
+                if (offs[c] != 0xffffffff) {
+                    affine_t p = points[offs[c] & 0x7fffffff];
+                    if (degree == 2) {
+                        accs[c].uadd(p, offs[c] >> 31);
+                    } else {
+                        accs[c].add(p, offs[c] >> 31);
+                        }
+                    offs[c] = 0xffffffff;
+                }
             }
             j = 0;
         }
     }
 
-    for (uint32_t off = 1; off < warp_sz;) {
-        auto down = shfl_down(acc, off*degree);
+    bucket_t acc = accs[0];
+    #pragma unroll
+    for (int i = 1; i < COARSENING_FACTOR; i++) {
+        acc.uadd(accs[i]);
+        }
 
+    for (uint32_t off = 1; off < warp_sz * COARSENING_FACTOR;) {
+        auto down = shfl_down(acc, off * degree);
         off <<= 1;
-        if ((xid & (off-1)) == 0)
-            acc.uadd(down); // .add() triggers spills ... in .shfl_down()
+        if (((xid_base / COARSENING_FACTOR) & (off - 1)) == 0) {
+            acc.uadd(down);
+           }
     }
 
     cooperative_groups::this_grid().sync();
 
-    if (xid == 0)
-        ret[tid/warp_sz] = acc;
+    if ((xid_base / COARSENING_FACTOR) == 0) {
+        ret[tid / (warp_sz * COARSENING_FACTOR)] = acc;
+        }
 
-    if (threadIdx.x + blockIdx.x == 0)
+    if (threadIdx.x + blockIdx.x == 0) {
         current = 0;
+        }
 }
 
 template<class bucket_t, class affine_h,
@@ -151,6 +178,7 @@ void batch_addition(bucket_h ret[], const affine_h points[], size_t npoints,
    int tids = threadIdx.x + blockIdx.x * blockDim.x;
 
     for (size_t tile_start = 0; tile_start < ndigits; tile_start += TILE_SIZE) {
+    // Load tile of points into shared memory
     if (threadIdx.x < TILE_SIZE && tile_start + threadIdx.x < ndigits) {
         uint32_t digit = digits[tile_start + threadIdx.x];
         point_tile[threadIdx.x] = points[digit & 0x7fffffff];
@@ -158,6 +186,7 @@ void batch_addition(bucket_h ret[], const affine_h points[], size_t npoints,
 
     __syncthreads();
 
+    // Iterate over this tile using thread striding
     for (size_t i = tile_start + tids; i < tile_start + TILE_SIZE && i < ndigits; i += gridDim.x * blockDim.x / degree) {
         uint32_t digit = digits[i];
         affine_t p = point_tile[i - tile_start];
