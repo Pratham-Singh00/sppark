@@ -1,460 +1,125 @@
-// Copyright Supranational LLC
-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
-
 #ifndef __SPPARK_MSM_PIPPENGER_HPP__
 #define __SPPARK_MSM_PIPPENGER_HPP__
 
-#include <vector>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <tuple>
-
-#include "glv.hpp"
 #include <util/thread_pool_t.hpp>
+#include "glv.hpp"   
 
-// Copyright Supranational LLC
-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
-
-
-namespace pasta_msm {
-
-template<typename bucket_t, typename scalar_t>
-void mult_pippenger_glv(
-    typename bucket_t::point_t& ret,
-    const typename bucket_t::affine_t points[],
-    size_t npoints,
-    const scalar_t scalars[], // <-- dual scalar type allowed!
-    bool mont = true,
-    thread_pool_t* da_pool = nullptr)
-{
-    constexpr size_t top_nbits = 128;  // GLV halves scalar bits
-    constexpr size_t wbits = 16;
-    const size_t nwins = (top_nbits + wbits - 1) / wbits;
-    const size_t nbuckets = 1 << wbits;
-
-    bucket_t* buckets = new bucket_t[nbuckets];
-
-    ret = bucket_t::point_t::zero();
-
-    for (size_t win = 0; win < nwins; ++win) {
-        size_t cbits = win * wbits;
-        size_t usebits = (win == 0) ? ((top_nbits - 1) % wbits + 1) : wbits;
-
-        for (size_t i = 0; i < npoints; ++i) {
-            uint32_t k1[8], k2[8];
-            bool k1_neg, k2_neg;
-            glv_split(scalars[i].val, k1, k1_neg, k2, k2_neg);
-
-            size_t wval1 = get_wval((const unsigned char*)k1, cbits, usebits);
-            size_t wval2 = get_wval((const unsigned char*)k2, cbits, usebits);
-
-            if (wval1) {
-                auto P = points[i];
-                if (k1_neg) P.Y = -P.Y;
-                buckets[wval1].add(P);
-            }
-
-            if (wval2) {
-                auto P = points[i];
-                P.X = P.X * typename bucket_t::field_t(GLVConstants::beta);
-                if (k2_neg) P.Y = -P.Y;
-                buckets[wval2].add(P);
-            }
-        }
-
-        integrate_buckets(ret, buckets, usebits);
-        if (win + 1 < nwins) {
-            for (size_t j = 0; j < wbits; ++j)
-                ret.dbl();
-        }
-    }
-
-    delete[] buckets;
-    if (mont)
-        ret.to_mont();
-}
-
-template<class point_t, class bucket_t>
-static void integrate_buckets(point_t& out, bucket_t buckets[], size_t wbits)
-{
-    bucket_t acc, ret;
-    size_t n = (size_t)1 << wbits;
-
-    acc = buckets[--n];
-    ret = buckets[n];
-    buckets[n].inf();
-    while (n--) {
-        acc.add(buckets[n]);
-        ret.add(acc);
-        buckets[n].inf();
-    }
-    out = ret;
-}
-
-} // namespace pasta_msm
-
-#endif
-/* Works up to 25 bits. */
 static size_t get_wval(const unsigned char *d, size_t off, size_t bits)
 {
     size_t i, top = (off + bits - 1)/8;
     size_t ret, mask = (size_t)0 - 1;
-
-    d   += off/8;
-    top -= off/8-1;
-
-    /* this is not about constant-time-ness, but branch optimization */
+    d   += off/8;     top -= off/8-1;
     for (ret=0, i=0; i<4;) {
         ret |= (*d & mask) << (8*i);
         mask = (size_t)0 - ((++i - top) >> (8*sizeof(top)-1));
         d += 1 & mask;
     }
-
     return ret >> (off%8);
 }
 
 static inline size_t window_size(size_t npoints)
 {
-    size_t wbits;
-
-    for (wbits=0; npoints>>=1; wbits++) ;
-
-    return wbits>12 ? wbits-3 : (wbits>4 ? wbits-2 : (wbits ? 2 : 1));
+    size_t w=0; for (; npoints>>=1; ++w);
+    return w>12 ? w-3 : (w>4 ? w-2 : (w ? 2 : 1));
 }
 
-template<class point_t, class bucket_t>
-static void integrate_buckets(point_t& out, bucket_t buckets[], size_t wbits)
+template<class P, class B>
+static void integrate_buckets(P &out, B buckets[], size_t w)
 {
-    bucket_t ret, acc;
-    size_t n = (size_t)1 << wbits;
-
-    /* Calculate sum of x[i-1]*i for i=1 through 1<<|wbits|. */
-    acc = buckets[--n];
-    ret = buckets[n];
-    buckets[n].inf();
-    while (n--) {
-        acc.add(buckets[n]);
-        ret.add(acc);
-        buckets[n].inf();
+    size_t top = 1u<<w;
+    B acc = buckets[top-1], sum = acc;
+    buckets[top-1].inf();
+    for (size_t i=top-1; i-->0; ) {
+        acc.add(buckets[i]);
+        sum.add(acc);
+        buckets[i].inf();
     }
-    out = ret;
+    out = sum;
 }
 
-template<class bucket_t, class affine_t>
-static void bucket(bucket_t buckets[], size_t booth_idx,
-                   size_t wbits, const affine_t& p)
+template<class B, class A>
+static void bucket(B buckets[], size_t idx, size_t w, A const &p)
 {
-    booth_idx &= (1<<wbits) - 1;
-    if (booth_idx--)
-        buckets[booth_idx].add(p);
+    idx &= (1u<<w)-1;
+    if (idx--) buckets[idx].add(p);
 }
 
-template<class bucket_t>
-static void prefetch(const bucket_t buckets[], size_t booth_idx, size_t wbits)
-{
-#if 0
-    booth_idx &= (1<<wbits) - 1;
-    if (booth_idx--)
-        vec_prefetch(&buckets[booth_idx], sizeof(buckets[booth_idx]));
-#else
-    (void)buckets;
-    (void)booth_idx;
-    (void)wbits;
-#endif
-}
+namespace pasta_msm {
 
-template<class point_t, class affine_t, class bucket_t>
-static void tile(point_t& ret, const affine_t points[], size_t npoints,
-                 const unsigned char* scalars, size_t nbits,
-                 bucket_t buckets[], size_t bit0, size_t wbits, size_t cbits)
-{
-    size_t wmask, wval, wnxt;
-    size_t i, nbytes;
+template<typename BucketT, typename ScalarT>
+void mult_pippenger_glv(
+    typename BucketT::point_t      &ret,
+    typename BucketT::affine_t const pts[],
+    size_t                          npts,
+    ScalarT const                   scalars[],
+    bool                            mont = true,
+    thread_pool_t                 *pool  = nullptr
+) {
+    using Affine = typename BucketT::affine_t;
+    using PowT   = typename ScalarT::pow_t;
 
-    nbytes = (nbits + 7)/8; /* convert |nbits| to bytes */
-    wmask = ((size_t)1 << wbits) - 1;
-    wval = get_wval(scalars, bit0, wbits) & wmask;
-    scalars += nbytes;
-    wnxt = get_wval(scalars, bit0, wbits) & wmask;
-    npoints--;  /* account for prefetch */
+    constexpr size_t TOP = ScalarT::nbits;
+    constexpr size_t W   = 16;
+    size_t nw = (TOP + W - 1)/W;
+    size_t nb = 1u<<W;
 
-    bucket(buckets, wval, cbits, points[0]);
-    for (i = 1; i < npoints; i++) {
-        wval = wnxt;
-        scalars += nbytes;
-        wnxt = get_wval(scalars, bit0, wbits) & wmask;
-        prefetch(buckets, wnxt, cbits);
-        bucket(buckets, wval, cbits, points[i]);
-    }
-    bucket(buckets, wnxt, cbits, points[i]);
-    integrate_buckets(ret, buckets, cbits);
-}
-
-template<typename T>
-static size_t num_bits(T l)
-{
-    const size_t T_BITS = 8*sizeof(T);
-# define MSB(x) ((T)(x) >> (T_BITS-1))
-    T x, mask;
-
-    if ((T)-1 < 0) {    // handle signed T
-        mask = MSB(l);
-        l ^= mask;
-        l += 1 & mask;
-    }
-
-    size_t bits = (((T)(~l & (l-1)) >> (T_BITS-1)) & 1) ^ 1;
-
-    if (sizeof(T) > 4) {
-        x = l >> (32 & (T_BITS-1));
-        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
-        bits += 32 & mask;
-        l ^= (x ^ l) & mask;
-    }
-
-    if (sizeof(T) > 2) {
-        x = l >> 16;
-        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
-        bits += 16 & mask;
-        l ^= (x ^ l) & mask;
-    }
-
-    if (sizeof(T) > 1) {
-        x = l >> 8;
-        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
-        bits += 8 & mask;
-        l ^= (x ^ l) & mask;
-    }
-
-    x = l >> 4;
-    mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
-    bits += 4 & mask;
-    l ^= (x ^ l) & mask;
-
-    x = l >> 2;
-    mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
-    bits += 2 & mask;
-    l ^= (x ^ l) & mask;
-
-    bits += l >> 1;
-
-    return bits;
-# undef MSB
-}
-
-std::tuple<size_t, size_t, size_t>
-static breakdown(size_t nbits, size_t window, size_t ncpus)
-{
-    size_t nx, ny, wnd;
-
-    if (nbits > window * ncpus) {
-        nx = 1;
-        if (window + (wnd = num_bits(ncpus / 4)) > 18) {
-            wnd = window - wnd;
-        } else {
-            wnd = (nbits / window + ncpus - 1) / ncpus;
-            if ((nbits / (window+1) + ncpus - 1) / ncpus < wnd)
-                wnd = window + 1;
-            else
-                wnd = window;
-        }
-    } else {
-        nx = 2;
-        wnd = window - 2;
-        while ((nbits / wnd + 1) * nx < ncpus) {
-            nx += 1;
-            wnd = window - num_bits(3 * nx / 2);
-        }
-        nx -= 1;
-        wnd = window - num_bits(3 * nx / 2);
-    }
-    ny = nbits / wnd + 1;
-    wnd = nbits / ny + 1;
-
-    return std::make_tuple(nx, ny, wnd);
-}
-
-template <class point_t, class affine_t, typename pow_t>
-static void mult(point_t& ret, const affine_t& point,
-                 const pow_t scalar, size_t top)
-{
+    std::unique_ptr<BucketT[]> buckets(new BucketT[nb]);
     ret.inf();
-    if (point.is_inf())
-        return;
 
-    struct is_bit {
-        static bool set(const pow_t v, size_t i)
-        {   return (v[i/8] >> (i%8)) & 1;   }
-    };
-
-    while (--top && !is_bit::set(scalar, top)) ;
-    if (is_bit::set(scalar, top)) {
-        ret = point;
-        while (top--) {
-            ret.dbl();
-            if (is_bit::set(scalar, top))
-                ret.add(point);
-        }
-    }
-}
-
-#include <util/thread_pool_t.hpp>
-
-template <class bucket_t, class point_t, class scalar_t,
-          class affine_t = class bucket_t::affine_t>
-static void mult_pippenger(point_t& ret, const affine_t points[], size_t npoints,
-                           const scalar_t _scalars[], bool mont,
-                           thread_pool_t* da_pool = nullptr)
-{
-    typedef typename scalar_t::pow_t pow_t;
-    size_t nbits = scalar_t::nbits;
-    size_t window = window_size(npoints);
-    size_t ncpus = da_pool ? da_pool->size() : 0;
-
-    // below is little-endian dependency, should it be removed?
-    const pow_t* scalars = reinterpret_cast<decltype(scalars)>(_scalars);
-    std::unique_ptr<pow_t[]> store = nullptr;
+    const PowT *ks = reinterpret_cast<const PowT*>(scalars);
+    std::unique_ptr<PowT[]> store;
     if (mont) {
-        store = decltype(store)(new pow_t[npoints]);
-        if (ncpus < 2 || npoints < 1024) {
-            for (size_t i = 0; i < npoints; i++)
-                _scalars[i].to_scalar(store[i]);
+        store.reset(new PowT[npts]);
+        if (!pool||npts<1024) {
+            for (size_t i=0;i<npts;i++) scalars[i].to_scalar(store[i]);
         } else {
-            da_pool->par_map(npoints, 512, [&](size_t i) {
-                _scalars[i].to_scalar(store[i]);
+            pool->par_map(npts,512,[&](size_t i){
+                scalars[i].to_scalar(store[i]);
             });
         }
-        scalars = &store[0];
+        ks = store.get();
     }
 
-    if (ncpus < 2 || npoints < 32) {
-        if (npoints == 1) { // for completeness
-            mult(ret, points[0], scalars[0], nbits);
-            return;
-        }
+    for (size_t win=0; win<nw; ++win) {
+        size_t bit0 = win*W;
+        size_t take = win? W : ((TOP-1)%W+1);
+        for (size_t b=0;b<nb;++b) buckets[b].inf();
+        for (size_t i=0;i<npts;++i) {
+            const uint32_t *limbs = (uint32_t*)&ks[i];
+            uint32_t k1[8], k2[8];
+            glv_split(limbs, k1, k2);
 
-        std::vector<bucket_t> buckets(1 << window); /* zeroed */
+            size_t w1 = get_wval((unsigned char*)k1, bit0, take);
+            if (w1) buckets[w1].add(pts[i]);
 
-        point_t p;
-        ret.inf();
-
-        /* top excess bits modulo target window size */
-        size_t wbits = nbits % window, /* yes, it may be zero */
-               cbits = wbits + 1,
-               bit0 = nbits;
-        while (bit0 -= wbits) {
-            tile(p, points, npoints, scalars[0], nbits,
-                    &buckets[0], bit0, wbits, cbits);
-            ret.add(p);
-            for (size_t i = 0; i < window; i++)
-                ret.dbl();
-            cbits = wbits = window;
-        }
-        tile(p, points, npoints, scalars[0], nbits,
-                &buckets[0], 0, wbits, cbits);
-        ret.add(p);
-        return;
-    }
-
-    size_t nx, ny;
-    std::tie(nx, ny, window) = breakdown(nbits, window, ncpus);
-
-    struct tile_t {
-        size_t x, dx, y, dy;
-        point_t p;
-        tile_t() {}
-    };
-    std::vector<tile_t> grid(nx * ny);
-
-    size_t dx = npoints / nx,
-           y  = window * (ny - 1);
-
-    size_t total = 0;
-    while (total < nx) {
-        grid[total].x  = total * dx;
-        grid[total].dx = dx;
-        grid[total].y  = y;
-        grid[total].dy = nbits - y;
-        total++;
-    }
-    grid[total - 1].dx = npoints - grid[total - 1].x;
-
-    while (y) {
-        y -= window;
-        for (size_t i = 0; i < nx; i++, total++) {
-            grid[total].x  = grid[i].x;
-            grid[total].dx = grid[i].dx;
-            grid[total].y  = y;
-            grid[total].dy = window;
-        }
-    }
-
-    std::vector<std::atomic<size_t>> row_sync(ny); /* zeroed */
-    counter_t<size_t> counter(0);
-    channel_t<size_t> ch;
-
-    auto n_workers = std::min(ncpus, total);
-    while (n_workers--) {
-        da_pool->spawn([&, window, total, nbits, nx, counter]() {
-            size_t work;
-            if ((work = counter++) < total) {
-                std::vector<bucket_t> buckets(1 << window); /* zeroed */
-
-                do {
-                    size_t x  = grid[work].x,
-                           dx = grid[work].dx,
-                           y  = grid[work].y,
-                           dy = grid[work].dy;
-                    tile(grid[work].p, &points[x], dx,
-                                       scalars[x], nbits, &buckets[0],
-                                       y, dy, dy + (dy < window));
-                    if (++row_sync[y / window] == nx)
-                        ch.send(y);
-                } while ((work = counter++) < total);
+            size_t w2 = get_wval((unsigned char*)k2, bit0, take);
+            if (w2) {
+                Affine tmp;
+                transform_point_glv<BucketT>(pts[i], tmp);
+                buckets[w2].add(tmp);
             }
-        });
-    }
-
-    ret.inf();
-    size_t row = 0;
-    while (ny--) {
-        auto y = ch.recv();
-        row_sync[y / window] = -1U;
-        while (grid[row].y == y) {
-            while (row < total && grid[row].y == y)
-                ret.add(grid[row++].p);
-            if (y == 0)
-                break;
-            for (size_t i = 0; i < window; i++)
-                ret.dbl();
-            y -= window;
-            if (row_sync[y / window] != -1U)
-                break;
         }
+        typename BucketT::point_t acc, sum;
+        size_t m = nb;
+        acc = buckets[--m];
+        sum = buckets[m];
+        buckets[m].inf();
+        while (m--) {
+            acc.add(buckets[m]);
+            sum.add(acc);
+            buckets[m].inf();
+        }
+        ret.add(sum);
+        if (win+1<nw)
+            for (size_t d=0; d<W; ++d)
+                ret.dbl();
     }
 }
 
-template <class bucket_t, class point_t, class scalar_t,
-          class affine_t = class bucket_t::affine_t>
-static void mult_pippenger(point_t& ret, const std::vector<affine_t>& points,
-                           const std::vector<scalar_t>& scalars, bool mont,
-                           thread_pool_t* da_pool = nullptr)
-{
-    mult_pippenger<bucket_t>(ret, points.data(),
-                                  std::min(points.size(), scalars.size()),
-                                  scalars.data(), mont, da_pool);
-}
+} 
 
-#include <util/slice_t.hpp>
-
-template <class bucket_t, class point_t, class scalar_t,
-          class affine_t = class bucket_t::affine_t>
-static void mult_pippenger(point_t& ret, slice_t<affine_t> points,
-                           slice_t<scalar_t> scalars, bool mont,
-                           thread_pool_t* da_pool = nullptr)
-{
-    mult_pippenger<bucket_t>(ret, points.data(),
-                                  std::min(points.size(), scalars.size()),
-                                  scalars.data(), mont, da_pool);
-}
-
+#endif // __SPPARK_MSM_PIPPENGER_HPP__
