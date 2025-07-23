@@ -9,91 +9,6 @@
 #include <memory>
 #include <tuple>
 
-#include "glv.hpp"
-#include <util/thread_pool_t.hpp>
-
-// Copyright Supranational LLC
-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
-
-
-namespace pasta_msm {
-
-template<typename bucket_t, typename scalar_t>
-void mult_pippenger_glv(
-    typename bucket_t::point_t& ret,
-    const typename bucket_t::affine_t points[],
-    size_t npoints,
-    const scalar_t scalars[], // <-- dual scalar type allowed!
-    bool mont = true,
-    thread_pool_t* da_pool = nullptr)
-{
-    constexpr size_t top_nbits = 128;  // GLV halves scalar bits
-    constexpr size_t wbits = 16;
-    const size_t nwins = (top_nbits + wbits - 1) / wbits;
-    const size_t nbuckets = 1 << wbits;
-
-    bucket_t* buckets = new bucket_t[nbuckets];
-
-    ret = bucket_t::point_t::zero();
-
-    for (size_t win = 0; win < nwins; ++win) {
-        size_t cbits = win * wbits;
-        size_t usebits = (win == 0) ? ((top_nbits - 1) % wbits + 1) : wbits;
-
-        for (size_t i = 0; i < npoints; ++i) {
-            uint32_t k1[8], k2[8];
-            bool k1_neg, k2_neg;
-            glv_split(scalars[i].val, k1, k1_neg, k2, k2_neg);
-
-            size_t wval1 = get_wval((const unsigned char*)k1, cbits, usebits);
-            size_t wval2 = get_wval((const unsigned char*)k2, cbits, usebits);
-
-            if (wval1) {
-                auto P = points[i];
-                if (k1_neg) P.Y = -P.Y;
-                buckets[wval1].add(P);
-            }
-
-            if (wval2) {
-                auto P = points[i];
-                P.X = P.X * typename bucket_t::field_t(GLVConstants::beta);
-                if (k2_neg) P.Y = -P.Y;
-                buckets[wval2].add(P);
-            }
-        }
-
-        integrate_buckets(ret, buckets, usebits);
-        if (win + 1 < nwins) {
-            for (size_t j = 0; j < wbits; ++j)
-                ret.dbl();
-        }
-    }
-
-    delete[] buckets;
-    if (mont)
-        ret.to_mont();
-}
-
-template<class point_t, class bucket_t>
-static void integrate_buckets(point_t& out, bucket_t buckets[], size_t wbits)
-{
-    bucket_t acc, ret;
-    size_t n = (size_t)1 << wbits;
-
-    acc = buckets[--n];
-    ret = buckets[n];
-    buckets[n].inf();
-    while (n--) {
-        acc.add(buckets[n]);
-        ret.add(acc);
-        buckets[n].inf();
-    }
-    out = ret;
-}
-
-} // namespace pasta_msm
-
-#endif
 /* Works up to 25 bits. */
 static size_t get_wval(const unsigned char *d, size_t off, size_t bits)
 {
@@ -457,4 +372,4 @@ static void mult_pippenger(point_t& ret, slice_t<affine_t> points,
                                   std::min(points.size(), scalars.size()),
                                   scalars.data(), mont, da_pool);
 }
-
+#endif
