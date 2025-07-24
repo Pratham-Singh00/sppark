@@ -5,6 +5,8 @@
 #ifndef __SPPARK_MSM_PIPPENGER_OLD_HPP__
 #define __SPPARK_MSM_PIPPENGER_OLD_HPP__
 
+#include "pippenger_common.hpp"
+
 #include <vector>
 #include <memory>
 #include <tuple>

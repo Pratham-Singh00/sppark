@@ -14,7 +14,7 @@
 
 #include "sort.cuh"
 #include "batch_addition.cuh"
-#include "pippenger.hpp"
+#include "pippenger_old.hpp"
 
 #ifndef WARP_SZ
 # define WARP_SZ 32
@@ -729,7 +729,7 @@ private:
 };
 
 template<class bucket_t, class point_t, class affine_t, class scalar_t> static
-RustError mult_pippenger_glv(point_t *out, const affine_t points[], size_t npoints,
+RustError mult_pippenger(point_t *out, const affine_t points[], size_t npoints,
                                        const scalar_t scalars[], bool mont = true,
                                        size_t ffi_affine_sz = sizeof(affine_t))
 {
