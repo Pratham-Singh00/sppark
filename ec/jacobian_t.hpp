@@ -16,6 +16,7 @@ class jacobian_t {
     inline operator void*()             { return this; }
 
 public:
+    using affine_t = Affine_t<field_t, field_h, a4>;
     jacobian_t() = default;
     jacobian_t(const field_t& x, const field_t& y, const field_t& z) :
                             X(x),             Y(y),             Z(z) {}

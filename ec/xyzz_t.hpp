@@ -87,6 +87,7 @@ public:
 #ifdef __SPPARK_EC_JACOBIAN_T_HPP__
     inline operator jacobian_t<field_t, field_h, a4>() const
     {   return jacobian_t<field_t, field_h, a4>{ X*ZZ, Y*ZZZ, ZZ };   }
+    using point_t jacobian_t<field_t, field_h, a4>;
 #endif
 
 #ifdef __CUDA_ARCH__

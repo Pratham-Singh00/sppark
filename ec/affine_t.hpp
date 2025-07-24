@@ -20,9 +20,9 @@ class Affine_t {
 template<class, class H, const H*> friend class jacobian_t;
 template<class, class H, const H*> friend class xyzz_t;
 
-    field_t X, Y;
-
+    
 public:
+    field_t X, Y;
     inline __host__ __device__ Affine_t() {}
     inline __host__ __device__ Affine_t(const field_t& x, const field_t& y) :
                                                      X(x),             Y(y) {}

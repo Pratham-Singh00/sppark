@@ -10,7 +10,7 @@
 
 #include <cstdint>
 #include <array>
-
+#include "../ec/affine_t.hpp"
 namespace pasta_msm {
 
 class GLVConstants {
@@ -19,11 +19,6 @@ public:
     static constexpr uint32_t lambda[8] = {
         0x50aa0e4f, 0x2aa9d2e0, 0x47c033af, 0x0fed467d,
         0x1cf70f5a, 0x511db4d8, 0x283e528e, 0x06819a58
-    };
-
-    static constexpr uint32_t beta[8] = {
-        0xfdfe4ab9, 0x1dad5ebd, 0x37ad3149, 0x1d1f8bd2,
-        0x57aab1b0, 0x2caad5dc, 0x4acdba71, 0x12ccca83
     };
 
     static constexpr uint32_t Pallas_a1[8] = {
@@ -54,6 +49,11 @@ public:
     static constexpr uint32_t g2[8] = {
         0x4a95a2d9, 0x8480fa55, 0x61afdea6, 0xffffffff,
         0x32c49e4b, 0x02a2654e, 0x279a7459, 0x00000001
+    };
+
+    static constexpr long long unsigned int beta[4] = {
+        0x1dad5ebdfdfe4ab9, 0x1d1f8bd237ad3149,
+        0x2caad5dc57aab1b0, 0x12ccca834acdba71
     };
 };
 
@@ -130,19 +130,19 @@ inline void glv_split(const uint32_t k[8], uint32_t k1[8], uint32_t k2[8]) {
 //k2 (beta*x,y)
 //add 1 to scalar, add the first 4 limbs to bucket but add (x,-y)
 template<typename PointT>
-inline void transform_point_glv(const typename PointT::affine_t& in,
-                              typename PointT::affine_t& out) {
+inline void transform_point_glv(const PointT& in, PointT& out) {
     // Compute λP = (βx, y) efficiently
     out.Y = in.Y;  // y-coordinate remains unchanged
     
     // Load beta constant and compute βx
-    typename PointT::field_t beta;
-    for (size_t i = 0; i < 8; i++) {
-        beta.val[i] = GLVConstants::beta[i];
-    }
+    decltype(in.X) beta(GLVConstants::beta);
     out.X = in.X * beta;
 }
 
 } // namespace pasta_msm
-
+// Add definitions for static constexpr arrays
+constexpr uint32_t pasta_msm::GLVConstants::Pallas_a1[8];
+constexpr uint32_t pasta_msm::GLVConstants::Pallas_b1[8];
+constexpr uint32_t pasta_msm::GLVConstants::Pallas_a2[8];
+constexpr uint32_t pasta_msm::GLVConstants::Pallas_b2[8];
 #endif
