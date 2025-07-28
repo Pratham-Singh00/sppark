@@ -7,7 +7,7 @@
 
 #include <cstdint>
 #include <array>
-#include <utility> // For std::pair
+#include <utility> 
 #include "../ec/affine_t.hpp"
 #include <iostream>
 namespace pasta_msm {
@@ -17,7 +17,6 @@ struct DecomposedScalar {
     bool is_negative=false;
 };
 
-// THESE ARE YOUR ORIGINAL CONSTANTS - RESTORED
 class GLVConstants {
 public:
     static constexpr uint32_t lambda[8] = {
@@ -138,7 +137,6 @@ glv_split(uint8_t v[32]) {
         carry_t1 = t1 >> 32;
         carry_t2 = t2 >> 32;
     }
-    // THIS IS OUR CORRECTED SIGN/MAGNITUDE HANDLING
     DecomposedScalar r1, r2;
     r1.is_negative = (k1_limbs[4]==0xffffffff);
     r2.is_negative = (k2_limbs[4]==0xffffffff);
@@ -176,5 +174,5 @@ void transform_point_glv(const PointT& in, PointT& out) {
     out.X *= beta;
 }
 
-} // namespace pasta_msm
+} 
 #endif
