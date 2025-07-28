@@ -1,21 +1,25 @@
 // Copyright Supranational LLC
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
-//
-// Author: psingh-7
-// Date: 2025-07-22
 
 #ifndef __SPPARK_MSM_GLV_HPP__
 #define __SPPARK_MSM_GLV_HPP__
 
 #include <cstdint>
 #include <array>
+#include <utility> // For std::pair
 #include "../ec/affine_t.hpp"
+#include <iostream>
 namespace pasta_msm {
 
+struct DecomposedScalar {
+    uint32_t k[4];
+    bool is_negative=false;
+};
+
+// THESE ARE YOUR ORIGINAL CONSTANTS - RESTORED
 class GLVConstants {
 public:
-    // Constants for GLV decomposition in Pallas curve
     static constexpr uint32_t lambda[8] = {
         0x50aa0e4f, 0x2aa9d2e0, 0x47c033af, 0x0fed467d,
         0x1cf70f5a, 0x511db4d8, 0x283e528e, 0x06819a58
@@ -50,99 +54,127 @@ public:
         0x4a95a2d9, 0x8480fa55, 0x61afdea6, 0xffffffff,
         0x32c49e4b, 0x02a2654e, 0x279a7459, 0x00000001
     };
-
+    
+    // This was already correct
     static constexpr long long unsigned int beta[4] = {
         0x1dad5ebdfdfe4ab9, 0x1d1f8bd237ad3149,
         0x2caad5dc57aab1b0, 0x12ccca834acdba71
     };
 };
 
-// GLV decomposition function
-inline void glv_split(const uint32_t k[8], uint32_t k1[8], uint32_t k2[8]) {
-    uint32_t tmp1[16]={0}, tmp2[16]={0};
-    for(int i=0;i<8;++i){
-        k1[i]=k[i];
-    }
-    for(int i=0;i<8;i++){
-        uint64_t c1=0,c2=0;
-        for(int j=0;j<8;j++){
-            uint64_t p1 = uint64_t(k[i])*GLVConstants::g1[j] + tmp1[i+j] + c1;
-            uint64_t p2 = uint64_t(k[i])*GLVConstants::g2[j] + tmp2[i+j] + c2;
-            tmp1[i+j] = uint32_t(p1);
-            tmp2[i+j] = uint32_t(p2);
-            c1 = p1>>32;
-            c2 = p2>>32;
+inline __host__ __device__
+std::pair<DecomposedScalar, DecomposedScalar>
+glv_split(uint8_t v[32]) {
+    uint32_t kl[8];
+    uint32_t k1_limbs[8], k2_limbs[8] = {0};
+
+    for(size_t i = 0; i < 8; i++){
+        uint32_t currlimb=0;
+        for(size_t j = 0; j < 4; j++){
+            currlimb+=(((uint32_t)v[i*4+j])<<(8*j));
         }
-        tmp1[i+8] = uint32_t(c1);
-        tmp2[i+8] = uint32_t(c2);
+        kl[i]=currlimb;
     }
-    tmp1[11]+=((tmp1[10]&(1ULL<<31))>0);
-    tmp2[11]+=((tmp2[10]&(1ULL<<31))>0);
-    
-    uint32_t c1[4]={0}, c2[4]={0};
-    for(int i=0;i<4;i++){
-        c1[i] = tmp1[11+i];
-        c2[i] = tmp2[11+i];
+    for(int i=0;i<8;++i){
+        k1_limbs[i]=kl[i];
     }
-    uint32_t c1a1[8]={0},c2a2[8]={0},c1b1[8]={0},c2b2[8]={0};
-    
-    for(int t=0;t<2;t++){
-        const uint32_t* C = (!t?c1:c2);
-        const uint32_t* A = (!t?GLVConstants::Pallas_a1:GLVConstants::Pallas_a2);
-        const uint32_t* B = (!t?GLVConstants::Pallas_b1:GLVConstants::Pallas_b2);
-        for(int i=0;i<4;i++){
-            uint64_t car1=0,car2=0;
-            for(int j=0;j<4;j++){
-                uint64_t v1=uint64_t(C[j])*A[i]+car1;
-                uint64_t v2=uint64_t(C[j])*B[i]+car2;
-                (!t?v1+=c1a1[i+j]:v1+=c2a2[i+j]);
-                (!t?v2+=c1b1[i+j]:v2+=c2b2[i+j]);
-                (!t?c1a1[i+j]=uint32_t(v1):c2a2[i+j]=uint32_t(v1));
-                (!t?c1b1[i+j]=uint32_t(v2):c2b2[i+j]=uint32_t(v2));
-                car1=v1>>32;
-                car2=v2>>32;
+    uint32_t tmp1[16] = {0}, tmp2[16] = {0};
+    for(int i = 0; i < 8; i++) {
+        uint64_t c1 = 0, c2 = 0;
+        for(int j = 0; j < 8; j++) {
+            uint64_t p1 = (uint64_t)kl[i] * GLVConstants::g1[j] + tmp1[i+j] + c1;
+            uint64_t p2 = (uint64_t)kl[i] * GLVConstants::g2[j] + tmp2[i+j] + c2;
+            tmp1[i+j] = (uint32_t)p1; tmp2[i+j] = (uint32_t)p2;
+            c1 = p1 >> 32; c2 = p2 >> 32;
+        }
+        tmp1[i+8] = (uint32_t)c1; tmp2[i+8] = (uint32_t)c2;
+    }
+    tmp1[11] += tmp1[10] >> 31;
+    tmp2[11] += tmp2[10] >> 31;
+
+    uint32_t c1_[4], c2_[4];
+    for(int i = 0; i < 4; i++) {
+        c1_[i] = tmp1[11 + i];
+        c2_[i] = tmp2[11 + i];
+    }
+
+    uint32_t c1a1[8] = {0}, c2a2[8] = {0}, c1b1[8] = {0}, c2b2[8] = {0};
+    for(int t = 0; t < 2; t++) {
+        const uint32_t* C = (t == 0) ? c1_ : c2_;
+        const uint32_t* A = (t == 0) ? GLVConstants::Pallas_a1 : GLVConstants::Pallas_a2;
+        const uint32_t* B = (t == 0) ? GLVConstants::Pallas_b1 : GLVConstants::Pallas_b2;
+        uint32_t* X = (t == 0) ? c1a1 : c2a2;
+        uint32_t* Y = (t == 0) ? c1b1 : c2b2;
+        for(int i = 0; i < 4; i++) {
+            uint64_t carry1 = 0, carry2 = 0;
+            for(int j = 0; j < 4; j++) {
+                uint64_t v1 = (uint64_t)C[j] * A[i] + X[i+j] + carry1;
+                uint64_t v2 = (uint64_t)C[j] * B[i] + Y[i+j] + carry2;
+                X[i+j] = (uint32_t)v1;
+                Y[i+j] = (uint32_t)v2;
+                carry1 = v1 >> 32;
+                carry2 = v2 >> 32;
             }
-            (!t?c1a1[i+4]=car1:c2a2[i+4]=car1);
-            (!t?c1b1[i+4]=car2:c2b2[i+4]=car2);
+            X[i+4] = (uint32_t)carry1;
+            Y[i+4] = (uint32_t)carry2;
         }
     }
     
-    bool car1=true,car2=true,car3=true;
-    for(int i=0;i<8;++i){
-        c1a1[i]=~c1a1[i];c2a2[i]=~c2a2[i];c2b2[i]=~c2b2[i];
-        if(car1){c1a1[i]++;car1=(c1a1[i]==0);}
-        if(car2){c2a2[i]++;car2=(c2a2[i]==0);}
-        if(car3){c2b2[i]++;car3=(c2b2[i]==0);}
+    bool carry1 = true, carry2 = true, carry3 = true;
+    for(int i = 0; i < 8; i++) {
+        c1a1[i] = ~c1a1[i]; c2a2[i] = ~c2a2[i]; c2b2[i] = ~c2b2[i];
+        if(carry1) { c1a1[i]++; carry1 = (c1a1[i] == 0); }
+        if(carry2) { c2a2[i]++; carry2 = (c2a2[i] == 0); }
+        if(carry3) { c2b2[i]++; carry3 = (c2b2[i] == 0); }
     }
     
-    for(int i=0;i<8;++i){
-        uint64_t tmp=(uint64_t(k1[i])+c1a1[i]+c2a2[i]);
-        uint64_t tmp2=(uint64_t(k2[i])+c2b2[i]+c1b1[i]);
-        k1[i]=uint32_t(tmp);
-        k2[i]=uint32_t(tmp2);
-        if(i+1<8){
-            k1[i+1]+=((tmp&(3ULL<<32))>>32);
-            k2[i+1]+=((tmp2&(1ULL<<32))>>32);
-        }
+    uint64_t carry_t1 = 0;
+    uint64_t carry_t2 = 0;
+    for(int i = 0; i < 8; i++) {
+        uint64_t t1 = (uint64_t)k1_limbs[i] + c1a1[i] + c2a2[i] + carry_t1;
+        uint64_t t2 = (uint64_t)k2_limbs[i] + c2b2[i] + c1b1[i] + carry_t2;
+        k1_limbs[i] = (uint32_t)t1;
+        k2_limbs[i] = (uint32_t)t2;
+        carry_t1 = t1 >> 32;
+        carry_t2 = t2 >> 32;
     }
+    // THIS IS OUR CORRECTED SIGN/MAGNITUDE HANDLING
+    DecomposedScalar r1, r2;
+    r1.is_negative = (k1_limbs[4]==0xffffffff);
+    r2.is_negative = (k2_limbs[4]==0xffffffff);
+
+    if (r1.is_negative) {
+        uint64_t carry = 1;
+        for (int i = 0; i < 4; i++) {
+            uint64_t neg_k = (uint64_t)(~k1_limbs[i]) + carry;
+            r1.k[i] = (uint32_t)neg_k;
+            carry = neg_k >> 32;
+        }
+    } else {
+        for (int i = 0; i < 4; i++) r1.k[i] = k1_limbs[i];
+    }
+    if (r2.is_negative) {
+        uint64_t carry = 1;
+        for (int i = 0; i < 4; i++) {
+            uint64_t neg_k = (uint64_t)(~k2_limbs[i]) + carry;
+            r2.k[i] = (uint32_t)neg_k;
+            carry = neg_k >> 32;
+        }
+    } else {
+        for (int i = 0; i < 4; i++) r2.k[i] = k2_limbs[i];
+    }
+    
+    return {r1, r2};
 }
-//k1 P
-//k2 (beta*x,y)
-//add 1 to scalar, add the first 4 limbs to bucket but add (x,-y)
+
 template<typename PointT>
-inline void transform_point_glv(const PointT& in, PointT& out) {
-    // Compute λP = (βx, y) efficiently
-    out.Y = in.Y;  // y-coordinate remains unchanged
-    
-    // Load beta constant and compute βx
+inline __host__ __device__
+void transform_point_glv(const PointT& in, PointT& out) {
+    out=in;
     decltype(in.X) beta(GLVConstants::beta);
-    out.X = in.X * beta;
+    beta.to();
+    out.X *= beta;
 }
 
 } // namespace pasta_msm
-// Add definitions for static constexpr arrays
-constexpr uint32_t pasta_msm::GLVConstants::Pallas_a1[8];
-constexpr uint32_t pasta_msm::GLVConstants::Pallas_b1[8];
-constexpr uint32_t pasta_msm::GLVConstants::Pallas_a2[8];
-constexpr uint32_t pasta_msm::GLVConstants::Pallas_b2[8];
 #endif

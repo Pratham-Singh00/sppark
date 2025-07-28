@@ -36,7 +36,7 @@ pub fn multi_scalar_mult(
 
     let mut ret = blst_p1::default();
     let err =
-        unsafe { mult_pippenger(&mut ret, &points[0], npoints, &scalars[0]) };
+        unsafe {  mult_pippenger_glv(&mut ret, &points[0], npoints, &scalars[0]) };
     if err.code != 0 {
         panic!("{}", String::from(err));
     }

@@ -14,7 +14,7 @@
 
 #include "sort.cuh"
 #include "batch_addition.cuh"
-#include "pippenger.hpp"
+#include "pippenger.cuh"
 
 #ifndef WARP_SZ
 # define WARP_SZ 32
@@ -449,16 +449,16 @@ public:
     RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
                                    const scalar_t* scalars, bool mont = true,
                                    size_t ffi_affine_sz = sizeof(affine_t))
-    {
+    { // entrypoint
         assert(this->npoints == 0 || npoints <= this->npoints);
 
-        uint32_t lg_npoints = lg2(npoints + npoints/2);
+        uint32_t lg_npoints = lg2(npoints + npoints/2); 
         size_t batch = 1 << (std::max(lg_npoints, wbits) - wbits);
         batch >>= 6;
         batch = batch ? batch : 1;
         uint32_t stride = (npoints + batch - 1) / batch;
         stride = (stride+WARP_SZ-1) & ((size_t)0-WARP_SZ);
-
+        
         std::vector<result_t> res(nwins);
         std::vector<bucket_t> ones(gpu.sm_count() * BATCH_ADD_BLOCK_SIZE / WARP_SZ);
 
@@ -476,14 +476,13 @@ public:
             const char* points = reinterpret_cast<const char*>(points_);
             size_t d_point_sz = points ? (batch > 1 ? 2*stride : stride) : 0;
             d_point_sz *= sizeof(affine_h);
-
             size_t digits_sz = nwins * stride * sizeof(uint32_t);
 
             dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
 
             vec2d_t<uint2> d_temps{&d_temp[0], stride};
             vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
-
+            
             scalar_t* d_scalars = scalars ? (scalar_t*)&d_temp[0]
                                           : this->d_scalars;
             affine_h* d_points = points ? (affine_h*)&d_temp[temp_sz + digits_sz]
@@ -729,7 +728,7 @@ private:
 };
 
 template<class bucket_t, class point_t, class affine_t, class scalar_t> static
-RustError mult_pippenger_glv(point_t *out, const affine_t points[], size_t npoints,
+RustError mult_pippenger(point_t *out, const affine_t points[], size_t npoints,
                                        const scalar_t scalars[], bool mont = true,
                                        size_t ffi_affine_sz = sizeof(affine_t))
 {
