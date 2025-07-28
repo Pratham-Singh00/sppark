@@ -10,18 +10,13 @@
 #include <memory>
 #include <vector>
 #include <utility>
+#include <array>
 #include <util/thread_pool_t.hpp>
 #include "glv.hpp"
 #include "pippenger_common.hpp"
 
 namespace pasta_msm {
-size_t getwindow(const uint32_t k[4],size_t start_idx){
-    uint32_t block=(start_idx)/32;
-    uint32_t blockidx=start_idx%32;
-    uint32_t mask=k[block];
-    if(blockidx==16){return (mask>>16);}
-    else {return uint16_t(mask);}
-}
+
 template <class bucket_t,
           class point_t,
           class scalar_t,
@@ -36,73 +31,81 @@ void mult_pippenger_glv(
 ) {
     typedef typename scalar_t::pow_t pow_t;
     size_t ncpus = da_pool ? da_pool->size() : 0;
-    // below is little-endian dependency, should it be removed?
+    
     const pow_t* scalarsp = reinterpret_cast<decltype(scalarsp)>(scalars);
     std::unique_ptr<pow_t[]> store = nullptr;
     if (mont) {
         store = decltype(store)(new pow_t[npoints]);
+        auto convert_scalars = [&](size_t i) {
+            scalars[i].to_scalar(store[i]);
+        };
         if (ncpus < 2 || npoints < 1024) {
-            for (size_t i = 0; i < npoints; i++)
-                scalars[i].to_scalar(store[i]);
+            for (size_t i = 0; i < npoints; i++) convert_scalars(i);
         } else {
-            da_pool->par_map(npoints, 512, [&](size_t i) {
-                scalars[i].to_scalar(store[i]);
-            });
+            da_pool->par_map(npoints, 512, convert_scalars);
         }
         scalarsp = &store[0];
     }
-    constexpr size_t BITS_TO_PROCESS = 128; 
-    constexpr size_t W = 16;
-    constexpr size_t num_windows = (BITS_TO_PROCESS + W - 1) / W;
-    size_t num_buckets = size_t(1) << W;
-    std::vector<std::pair<DecomposedScalar, DecomposedScalar>> decomposed_scalars(npoints);
-    for (size_t i = 0; i < npoints; ++i) {
-        uint8_t tmp[32];
-        for(int j=0;j<32;++j){
-            tmp[j]=scalarsp[i][j];
+    
+    constexpr size_t WINDOW_BITS = 16;
+    constexpr size_t SCALAR_BITS = 128; 
+    constexpr size_t NUM_WINDOWS = (SCALAR_BITS + WINDOW_BITS - 1) / WINDOW_BITS;
+    constexpr size_t BUCKETS_PER_WINDOW = size_t(1) << (WINDOW_BITS - 1);
+    
+    using assignment_array_t = std::array<BucketAssignment, NUM_WINDOWS>;
+    
+
+    std::vector<assignment_array_t> assignments_k1(npoints);
+    std::vector<assignment_array_t> assignments_k2(npoints);
+    
+    auto precompute_assignments = [&](size_t i) {
+        uint8_t scalar_bytes[32];
+        for (int j = 0; j < 32; ++j) {
+            scalar_bytes[j] = scalarsp[i][j];
         }
-        decomposed_scalars[i] = glv_split(tmp);
+        auto [k1, k2] = glv_split(scalar_bytes);
+        assignments_k1[i] = recode_wnaf<WINDOW_BITS, NUM_WINDOWS>(k1);
+        assignments_k2[i] = recode_wnaf<WINDOW_BITS, NUM_WINDOWS>(k2);
+    };
+
+    if (ncpus < 2 || npoints < 1024) {
+        for (size_t i = 0; i < npoints; i++) precompute_assignments(i);
+    } else {
+        da_pool->par_map(npoints, 512, precompute_assignments);
     }
+    
     ret.inf();
-    std::unique_ptr<bucket_t[]> buckets(new bucket_t[num_buckets]);
-    for (size_t win = num_windows; win-- > 0;) {
-        if (win != num_windows - 1) {
-            for (size_t d = 0; d < W; ++d) {
+    std::unique_ptr<bucket_t[]> buckets(new bucket_t[BUCKETS_PER_WINDOW]);
+
+    for (size_t win = NUM_WINDOWS; win-- > 0;) {
+        if (win != NUM_WINDOWS - 1) {
+            for (size_t d = 0; d < WINDOW_BITS; ++d) {
                 ret.dbl();
             }
         }
-
-        for (size_t b = 0; b < num_buckets; ++b) {
+        for (size_t b = 0; b < BUCKETS_PER_WINDOW; ++b) {
             buckets[b].inf();
         }
-        
-        size_t bit_offset = win * W;
-
         for (size_t i = 0; i < npoints; ++i) {
-            const auto& decomp_pair = decomposed_scalars[i];
-            const auto& d1 = decomp_pair.first;
-            const auto& d2 = decomp_pair.second;
-
-            size_t w1 = getwindow(d1.k, bit_offset);
-            if (w1) {
+            const auto& assignment1 = assignments_k1[i][win];
+            if (assignment1.index != 0) {
                 affine_t p1 = pts[i];
-                p1.cneg(d1.is_negative);
-                buckets[w1].add(p1);
+                p1.cneg(!assignment1.add);
+                buckets[assignment1.index - 1].add(p1);
             }
 
-            size_t w2 = getwindow(d2.k, bit_offset);
-            if (w2) {
-                affine_t p2 = pts[i];
+            const auto& assignment2 = assignments_k2[i][win];
+            if (assignment2.index != 0) {
                 affine_t p2_transformed;
-                transform_point_glv<affine_t>(p2, p2_transformed);
-                p2_transformed.cneg(d2.is_negative);
-                buckets[w2].add(p2_transformed);
+                transform_point_glv<affine_t>(pts[i], p2_transformed);
+                p2_transformed.cneg(!assignment2.add);
+                buckets[assignment2.index - 1].add(p2_transformed);
             }
         }
-
+        
         point_t window_sum; window_sum.inf();
         point_t bucket_accumulator; bucket_accumulator.inf();
-        for (size_t m = num_buckets - 1; m > 0; --m) {
+        for (size_t m = BUCKETS_PER_WINDOW; m-- > 0;) {
             bucket_accumulator.add(point_t(buckets[m]));
             window_sum.add(bucket_accumulator);
         }

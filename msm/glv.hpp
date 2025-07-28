@@ -7,14 +7,21 @@
 
 #include <cstdint>
 #include <array>
-#include <utility> 
+#include <utility>
+#include <vector>
 #include "../ec/affine_t.hpp"
 #include <iostream>
+
 namespace pasta_msm {
 
 struct DecomposedScalar {
-    uint32_t k[4];
-    bool is_negative=false;
+    uint32_t k[4]; 
+    bool is_negative = false;
+};
+
+struct BucketAssignment {
+    uint32_t index = 0; 
+    bool add = true;   
 };
 
 class GLVConstants {
@@ -23,38 +30,30 @@ public:
         0x50aa0e4f, 0x2aa9d2e0, 0x47c033af, 0x0fed467d,
         0x1cf70f5a, 0x511db4d8, 0x283e528e, 0x06819a58
     };
-
     static constexpr uint32_t Pallas_a1[8] = {
         0x00000001, 0x7fcae1c7, 0x40f04915, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-
     static constexpr uint32_t Pallas_a2[8] = {
         0x00000000, 0x8cb12793, 0x40a89953, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-
     static constexpr uint32_t Pallas_b1[8] = {
         0x00000000, 0x8cb12793, 0x40a89953, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-
     static constexpr uint32_t Pallas_b2[8] = {
         0x00000001, 0x0c7c095a, 0x8198e269, 0x93cd3a2c,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-
     static constexpr uint32_t g1[8] = {
         0x111f6861, 0x086862e0, 0xc35fbd4d, 0x00000002,
         0x31f02568, 0x066389a4, 0x4f34e8b2, 0x00000002
     };
-
     static constexpr uint32_t g2[8] = {
         0x4a95a2d9, 0x8480fa55, 0x61afdea6, 0xffffffff,
         0x32c49e4b, 0x02a2654e, 0x279a7459, 0x00000001
     };
-    
-    // This was already correct
     static constexpr long long unsigned int beta[4] = {
         0x1dad5ebdfdfe4ab9, 0x1d1f8bd237ad3149,
         0x2caad5dc57aab1b0, 0x12ccca834acdba71
@@ -163,6 +162,48 @@ glv_split(uint8_t v[32]) {
     }
     
     return {r1, r2};
+}
+
+template <int WINDOW_BITS, int NUM_WINDOWS>
+inline std::array<BucketAssignment, NUM_WINDOWS> recode_wnaf(const DecomposedScalar& s) {
+    constexpr int c = WINDOW_BITS;
+    constexpr uint32_t L = 1U << c;
+    constexpr uint32_t HALF_L = 1U << (c - 1);
+    constexpr uint32_t MASK = L - 1;
+    
+    std::array<uint32_t, NUM_WINDOWS> slices{};
+    for (int i = 0; i < NUM_WINDOWS; ++i) {
+        const uint32_t bit_offset = i * c;
+        const uint32_t limb_idx = bit_offset / 32;
+        const uint32_t shift_in_limb = bit_offset % 32;
+        
+        uint64_t limb_pair = 0;
+        if (limb_idx < 4) { limb_pair = s.k[limb_idx]; }
+        if (limb_idx < 3) { limb_pair |= (uint64_t)s.k[limb_idx + 1] << 32; }
+        
+        slices[i] = (limb_pair >> shift_in_limb) & MASK;
+    }
+    
+    std::array<BucketAssignment, NUM_WINDOWS> assignments{};
+    uint32_t carry = 0;
+    
+    const bool base_add_op = !s.is_negative;
+
+    for (int i = 0; i < NUM_WINDOWS; i++) {
+        uint32_t current_slice = slices[i] + carry;
+        
+        if (current_slice >= HALF_L) {
+            assignments[i].index = L - current_slice;
+            assignments[i].add = !base_add_op; 
+            carry = 1;
+        } else {
+            assignments[i].index = current_slice;
+            assignments[i].add = base_add_op;  
+            carry = 0;
+        }
+    }
+    
+    return assignments;
 }
 
 template<typename PointT>

@@ -12,133 +12,183 @@
 #include <tuple>
 #include <algorithm>
 
-static inline size_t get_wval(const unsigned char *d, size_t off, size_t bits)
+static size_t get_wval(const unsigned char *d, size_t off, size_t bits)
 {
-    size_t i, top = (off + bits - 1) / 8;
-    size_t ret = 0, mask = static_cast<size_t>(-1);
-    d += off/8;
-    top -= off/8 - 1;
-    for (i = 0; i < 4; ) {
+    size_t i, top = (off + bits - 1)/8;
+    size_t ret, mask = (size_t)0 - 1;
+
+    d   += off/8;
+    top -= off/8-1;
+
+    /* this is not about constant-time-ness, but branch optimization */
+    for (ret=0, i=0; i<4;) {
         ret |= (*d & mask) << (8*i);
-        mask = static_cast<size_t>(
-          -(((long)++i - (long)top) >> (8*sizeof(top)-1))
-        );
-        d += mask & 1;
+        mask = (size_t)0 - ((++i - top) >> (8*sizeof(top)-1));
+        d += 1 & mask;
     }
-    return ret >> (off % 8);
+
+    return ret >> (off%8);
 }
 
 static inline size_t window_size(size_t npoints)
 {
-    size_t w = 0;
-    size_t t = npoints;
-    while (t >>= 1) ++w;
-    if      (w > 12) return w - 3;
-    else if (w >  4) return w - 2;
-    else if (w >  0) return 2;
-    else             return 1;
+    size_t wbits;
+
+    for (wbits=0; npoints>>=1; wbits++) ;
+
+    return wbits>12 ? wbits-3 : (wbits>4 ? wbits-2 : (wbits ? 2 : 1));
 }
 
-template<class P, class B>
-static inline void integrate_buckets(P &out, B buckets[], size_t wbits)
+template<class point_t, class bucket_t>
+static void integrate_buckets(point_t& out, bucket_t buckets[], size_t wbits)
 {
-    size_t n = static_cast<size_t>(1) << wbits;
-    B acc = buckets[--n];
-    B sum = acc;
+    bucket_t ret, acc;
+    size_t n = (size_t)1 << wbits;
+
+    /* Calculate sum of x[i-1]*i for i=1 through 1<<|wbits|. */
+    acc = buckets[--n];
+    ret = buckets[n];
     buckets[n].inf();
     while (n--) {
-        acc .add(buckets[n]);
-        sum .add(acc);
+        acc.add(buckets[n]);
+        ret.add(acc);
         buckets[n].inf();
     }
-    out = sum;
+    out = ret;
 }
 
-template<class B, class A>
-static inline void bucket(B buckets[], size_t idx, size_t wbits, A const &p)
+template<class bucket_t, class affine_t>
+static void bucket(bucket_t buckets[], size_t booth_idx,
+                   size_t wbits, const affine_t& p)
 {
-    idx &= (static_cast<size_t>(1) << wbits) - 1;
-    if (idx--) buckets[idx].add(p);
+    booth_idx &= (1<<wbits) - 1;
+    if (booth_idx--)
+        buckets[booth_idx].add(p);
 }
 
-template<class B>
-static inline void prefetch(const B[], size_t, size_t)
+template<class bucket_t>
+static void prefetch(const bucket_t buckets[], size_t booth_idx, size_t wbits)
 {
-    /* nop */
+#if 0
+    booth_idx &= (1<<wbits) - 1;
+    if (booth_idx--)
+        vec_prefetch(&buckets[booth_idx], sizeof(buckets[booth_idx]));
+#else
+    (void)buckets;
+    (void)booth_idx;
+    (void)wbits;
+#endif
 }
 
-template<class P, class A, class B>
-static inline void tile(
-    P &out,
-    A const pts[], size_t n,
-    const unsigned char *scalars, size_t nbits,
-    B buckets[], size_t bit0, size_t wbits, size_t cbits
-) {
-    size_t byte_len = (nbits + 7)/8;
-    size_t wmask    = (static_cast<size_t>(1) << wbits) - 1;
-    size_t w0       = get_wval(scalars, bit0, wbits) & wmask;
-    scalars += byte_len;
-    size_t w1       = get_wval(scalars, bit0, wbits) & wmask;
+template<class point_t, class affine_t, class bucket_t>
+static void tile(point_t& ret, const affine_t points[], size_t npoints,
+                 const unsigned char* scalars, size_t nbits,
+                 bucket_t buckets[], size_t bit0, size_t wbits, size_t cbits)
+{
+    size_t wmask, wval, wnxt;
+    size_t i, nbytes;
 
-    bucket(buckets, w0, cbits, pts[0]);
-    for (size_t i = 1; i + 1 < n; ++i) {
-        bucket(buckets, w1, cbits, pts[i]);
-        scalars += byte_len;
-        w1 = get_wval(scalars, bit0, wbits) & wmask;
-        prefetch(buckets, w1, cbits);
+    nbytes = (nbits + 7)/8; /* convert |nbits| to bytes */
+    wmask = ((size_t)1 << wbits) - 1;
+    wval = get_wval(scalars, bit0, wbits) & wmask;
+    scalars += nbytes;
+    wnxt = get_wval(scalars, bit0, wbits) & wmask;
+    npoints--;  /* account for prefetch */
+
+    bucket(buckets, wval, cbits, points[0]);
+    for (i = 1; i < npoints; i++) {
+        wval = wnxt;
+        scalars += nbytes;
+        wnxt = get_wval(scalars, bit0, wbits) & wmask;
+        prefetch(buckets, wnxt, cbits);
+        bucket(buckets, wval, cbits, points[i]);
     }
-    bucket(buckets, w1, cbits, pts[n-1]);
-    integrate_buckets(out, buckets, cbits);
+    bucket(buckets, wnxt, cbits, points[i]);
+    integrate_buckets(ret, buckets, cbits);
 }
 
 template<typename T>
-static inline size_t num_bits(T l)
+static size_t num_bits(T l)
 {
-    const size_t TB = 8 * sizeof(T);
-#   define MSB(x) ((T)(x) >> (TB-1))
-    T mask, x;
-    if ((T)-1 < 0) {
+    const size_t T_BITS = 8*sizeof(T);
+# define MSB(x) ((T)(x) >> (T_BITS-1))
+    T x, mask;
+
+    if ((T)-1 < 0) {    // handle signed T
         mask = MSB(l);
-        l   ^= mask;
-        l   += 1 & mask;
+        l ^= mask;
+        l += 1 & mask;
     }
-    size_t bits = ((((~l) & (l-1)) >> (TB-1)) & 1) ^ 1;
-    for (size_t shift : {32,16,8,4,2}) {
-        if (TB > shift) {
-            x    = l >> shift;
-            mask = MSB(0 - x);
-            if ((T)-1 > 0) mask = 0 - mask;
-            bits += shift & mask;
-            l    ^= (x ^ l) & mask;
-        }
+
+    size_t bits = (((T)(~l & (l-1)) >> (T_BITS-1)) & 1) ^ 1;
+
+    if (sizeof(T) > 4) {
+        x = l >> (32 & (T_BITS-1));
+        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
+        bits += 32 & mask;
+        l ^= (x ^ l) & mask;
     }
+
+    if (sizeof(T) > 2) {
+        x = l >> 16;
+        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
+        bits += 16 & mask;
+        l ^= (x ^ l) & mask;
+    }
+
+    if (sizeof(T) > 1) {
+        x = l >> 8;
+        mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
+        bits += 8 & mask;
+        l ^= (x ^ l) & mask;
+    }
+
+    x = l >> 4;
+    mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
+    bits += 4 & mask;
+    l ^= (x ^ l) & mask;
+
+    x = l >> 2;
+    mask = MSB(0 - x);  if ((T)-1 > 0) mask = 0 - mask;
+    bits += 2 & mask;
+    l ^= (x ^ l) & mask;
+
     bits += l >> 1;
-#   undef MSB
+
     return bits;
+# undef MSB
 }
 
-static inline std::tuple<size_t,size_t,size_t>
-breakdown(size_t nbits, size_t window, size_t ncpu)
+std::tuple<size_t, size_t, size_t>
+static breakdown(size_t nbits, size_t window, size_t ncpus)
 {
     size_t nx, ny, wnd;
-    if (nbits > window*ncpu) {
+
+    if (nbits > window * ncpus) {
         nx = 1;
-        size_t t = num_bits(static_cast<size_t>(ncpu/4));
-        if (window + t > 18) wnd = window - t;
-        else                 wnd = std::min(window+1,(nbits+window-1)/window);
+        if (window + (wnd = num_bits(ncpus / 4)) > 18) {
+            wnd = window - wnd;
+        } else {
+            wnd = (nbits / window + ncpus - 1) / ncpus;
+            if ((nbits / (window+1) + ncpus - 1) / ncpus < wnd)
+                wnd = window + 1;
+            else
+                wnd = window;
+        }
     } else {
         nx = 2;
         wnd = window - 2;
-        while ((nbits/wnd + 1)*nx < ncpu) {
-            ++nx;
-            wnd = window - num_bits(static_cast<size_t>(3*nx/2));
+        while ((nbits / wnd + 1) * nx < ncpus) {
+            nx += 1;
+            wnd = window - num_bits(3 * nx / 2);
         }
-        --nx;
-        wnd = window - num_bits(static_cast<size_t>(3*nx/2));
+        nx -= 1;
+        wnd = window - num_bits(3 * nx / 2);
     }
-    ny  = nbits / wnd + 1;
+    ny = nbits / wnd + 1;
     wnd = nbits / ny + 1;
-    return {nx,ny,wnd};
+
+    return std::make_tuple(nx, ny, wnd);
 }
 
 #endif // __SPPARK_MSM_PIPPENGER_COMMON_HPP__
