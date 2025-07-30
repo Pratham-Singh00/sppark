@@ -14,7 +14,9 @@
 
 #include "sort.cuh"
 #include "batch_addition.cuh"
-#include "pippenger.cuh"
+#include "glv.hpp"
+#include "../ec/affine_t.hpp"
+
 
 #ifndef WARP_SZ
 # define WARP_SZ 32
@@ -49,15 +51,16 @@ public:
 
 template<class scalar_t>
 __device__ __forceinline__
-static uint32_t get_wval(const scalar_T<scalar_t>& scalar, uint32_t off,
+static uint32_t get_wval(const scalar_t&scalar, uint32_t off,
                          uint32_t top_i = (scalar_t::nbits + 31) / 32 - 1)
+
 {
     uint32_t i = off / 32;
     uint64_t ret = scalar[i];
 
     if (i < top_i)
         ret |= (uint64_t)scalar[i+1] << 32;
-
+    //printf("get_wval: off %u, i %u, top_i %u, ret %016lx, scalar: %016lx, off: %016lx\n", off, i, top_i, ret, scalar[i], ret >> (off%32));
     return ret >> (off%32);
 }
 
@@ -83,7 +86,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
     const uint32_t tix = threadIdx.x + blockIdx.x*blockDim.x;
 
     const uint32_t top_i = (scalar_t::nbits + 31) / 32 - 1;
-    const uint32_t wmask = 0xffffffffU >> (31-wbits); // (1U << (wbits+1)) - 1;
+    const uint32_t wmask = 0xffffffffU >> (31-wbits); // (1U << (wbits+1)) - 1; //
 
     auto& scalar = xchange[tid/WARP_SZ](tid%WARP_SZ);
 
@@ -101,19 +104,48 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
         // clear the most significant bit
         uint32_t msb = s.abs();
         msb <<= 31;
-
         scalar = s;
+
+        if (i == 0 && tix == 0) {
+            const uint8_t* byt = reinterpret_cast<const uint8_t*>(&scalars[i]);
+            for(int j=0;j<8;++j){
+                printf("%08x ",(uint32_t(byt[j*4+3])<<24)+(uint32_t(byt[j*4+2])<<16)+(uint32_t(byt[j*4+1])<<8)+uint32_t(byt[j*4]));
+            }
+            printf("\n");
+            const uint8_t* byt2 = reinterpret_cast<const uint8_t*>(&scalar);
+            for(int j=0;j<8;++j){
+                printf("%08x ",(uint32_t(byt2[j*4+3])<<24)+(uint32_t(byt2[j*4+2])<<16)+(uint32_t(byt2[j*4+1])<<8)+uint32_t(byt2[j*4]));
+            }
+            printf("\n");
+            printf("\n--- TRACE FOR SCALAR 0 (nwins=%u, wbits=%u) ---\n", nwins, wbits);
+            
+            printf("  Full Scalar limbs [7...0]: %08x %08x %08x %08x %08x %08x %08x %08x\n", 
+                   s[7], s[6], s[5], s[4], s[3], s[2], s[1], s[0]);
+            printf("  Sign bit determined from absolute bit %u is: 0x%08x\n", msb);
+            printf("--------------------------------------------------------------------------\n");
+        }
 
         #pragma unroll 1
         for (uint32_t bit0 = nwins*wbits - 1, win = nwins; --win;) {
             bit0 -= wbits;
+            //uint32_t wval2 = (s[win/2] >> (win%2 * 16)) & 0xffff;
             uint32_t wval = get_wval(scalar, bit0, top_i);
+            if (i == 0 && tix == 0) {
+                printf("  win %u, bit0 %u, wval %08x\n", win, bit0, wval);
+            }
             wval = booth_encode(wval, wmask, wbits);
             if (wval) wval ^= msb;
             digits[win][i] = wval;
+            if (i == 0 && tix == 0) {
+                printf("  win %u, bit0 %u, wval %08x\n", win, bit0, wval);
+            }
         }
 
         uint32_t wval = s[0] << 1;
+        //uint32_t wval2 = (s[0]) & 0xffff;
+        if(i == 0 && tix == 0) {
+            printf("  win %u, bit0 %u, wval %08x\n", nwins-1, 0, wval);
+        }
         wval = booth_encode(wval, wmask, wbits);
         if (wval) wval ^= msb;
         digits[0][i] = wval;
@@ -142,7 +174,6 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 #elif MSM_NSTREAMS<2
 # error "invalid MSM_NSTREAMS"
 #endif
-
 template<class bucket_t,
          class affine_h,
          class bucket_h = class bucket_t::mem_t,
@@ -296,7 +327,6 @@ void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbi
     buckets[bid][2*tid+1] = acc;
 }
 #undef asm
-
 #ifndef SPPARK_DONT_INSTANTIATE_TEMPLATES
 template __global__
 void accumulate<bucket_t, affine_t::mem_t>(bucket_t::mem_t buckets_[],
@@ -355,15 +385,8 @@ public:
     {
         npoints = (np+WARP_SZ-1) & ((size_t)0-WARP_SZ);
 
-        wbits = 17;
-        if (npoints > 192) {
-            wbits = std::min(lg2(npoints + npoints/2) - 8, 18);
-            if (wbits < 10)
-                wbits = 10;
-        } else if (npoints > 0) {
-            wbits = 10;
-        }
-        nwins = (scalar_t::bit_length() - 1) / wbits + 1;
+        wbits = 16;
+        nwins = 8;
 
         uint32_t row_sz = 1U << (wbits-1);
 
@@ -446,129 +469,137 @@ private:
     }
 
 public:
+    
     RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
-                                   const scalar_t* scalars, bool mont = true,
-                                   size_t ffi_affine_sz = sizeof(affine_t))
-    { // entrypoint
-        assert(this->npoints == 0 || npoints <= this->npoints);
+                 const scalar_t* scalars, bool mont = true,
+                 size_t ffi_affine_sz = sizeof(affine_t))
+{
+    assert(this->npoints == 0 || npoints <= this->npoints);
 
-        uint32_t lg_npoints = lg2(npoints + npoints/2); 
-        size_t batch = 1 << (std::max(lg_npoints, wbits) - wbits);
-        batch >>= 6;
-        batch = batch ? batch : 1;
-        uint32_t stride = (npoints + batch - 1) / batch;
-        stride = (stride+WARP_SZ-1) & ((size_t)0-WARP_SZ);
-        
-        std::vector<result_t> res(nwins);
-        std::vector<bucket_t> ones(gpu.sm_count() * BATCH_ADD_BLOCK_SIZE / WARP_SZ);
+    // === GLV Decomposition ===
+    std::vector<scalar_t> glv_scalars(2 * npoints);
+    std::vector<affine_t> glv_points(2 * npoints);
 
-        out.inf();
-        point_t p;
-
-        try {
-            // |scalars| being nullptr means the scalars are pre-loaded to
-            // |d_scalars|, otherwise allocate stride.
-            size_t temp_sz = scalars ? sizeof(scalar_t) : 0;
-            temp_sz = stride * std::max(2*sizeof(uint2), temp_sz);
-
-            // |points| being nullptr means the points are pre-loaded to
-            // |d_points|, otherwise allocate double-stride.
-            const char* points = reinterpret_cast<const char*>(points_);
-            size_t d_point_sz = points ? (batch > 1 ? 2*stride : stride) : 0;
-            d_point_sz *= sizeof(affine_h);
-            size_t digits_sz = nwins * stride * sizeof(uint32_t);
-
-            dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
-
-            vec2d_t<uint2> d_temps{&d_temp[0], stride};
-            vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
-            
-            scalar_t* d_scalars = scalars ? (scalar_t*)&d_temp[0]
-                                          : this->d_scalars;
-            affine_h* d_points = points ? (affine_h*)&d_temp[temp_sz + digits_sz]
-                                        : this->d_points;
-
-            size_t d_off = 0;   // device offset
-            size_t h_off = 0;   // host offset
-            size_t num = stride > npoints ? npoints : stride;
-            event_t ev;
-
-            if (scalars)
-                gpu[2].HtoD(&d_scalars[d_off], &scalars[h_off], num);
-            digits(&d_scalars[0], num, d_digits, d_temps, mont);
-            gpu[2].record(ev);
-
-            if (points)
-                gpu[0].HtoD(&d_points[d_off], &points[h_off],
-                            num,              ffi_affine_sz);
-
-            for (uint32_t i = 0; i < batch; i++) {
-                gpu[i&1].wait(ev);
-
-                batch_addition<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE,
-                                           0, gpu[i&1]>>>(
-                    &d_buckets[nwins << (wbits-1)], &d_points[d_off], num,
-                    &d_digits[0][0], d_hist[0][0]
-                );
-                CUDA_OK(cudaGetLastError());
-
-                gpu[i&1].launch_coop(accumulate<bucket_t, affine_h>,
-                    {gpu.sm_count(), 0},
-                    d_buckets, nwins, wbits, &d_points[d_off], d_digits, d_hist, i&1
-                );
-                gpu[i&1].record(ev);
-
-                integrate<bucket_t><<<nwins, MSM_NTHREADS,
-                                      sizeof(bucket_t)*MSM_NTHREADS/bucket_t::degree,
-                                      gpu[i&1]>>>(
-                    d_buckets, nwins, wbits, scalar_t::bit_length()
-                );
-                CUDA_OK(cudaGetLastError());
-
-                if (i < batch-1) {
-                    h_off += stride;
-                    num = h_off + stride <= npoints ? stride : npoints - h_off;
-
-                    if (scalars)
-                        gpu[2].HtoD(&d_scalars[0], &scalars[h_off], num);
-                    gpu[2].wait(ev);
-                    digits(&d_scalars[scalars ? 0 : h_off], num,
-                           d_digits, d_temps, mont);
-                    gpu[2].record(ev);
-
-                    if (points) {
-                        size_t j = (i + 1) & 1;
-                        d_off = j ? stride : 0;
-                        gpu[j].HtoD(&d_points[d_off], &points[h_off*ffi_affine_sz],
-                                    num,              ffi_affine_sz);
-                    } else {
-                        d_off = h_off;
-                    }
-                }
-
-                if (i > 0) {
-                    collect(p, res, ones);
-                    out.add(p);
-                }
-
-                gpu[i&1].DtoH(ones, d_buckets + (nwins << (wbits-1)));
-                gpu[i&1].DtoH(res, d_buckets, sizeof(bucket_h)<<(wbits-1));
-                gpu[i&1].sync();
-            }
-        } catch (const cuda_error& e) {
-            gpu.sync();
-#ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
-            return RustError{e.code(), e.what()};
-#else
-            return RustError{e.code()};
-#endif
-        }
-
-        collect(p, res, ones);
-        out.add(p);
-
-        return RustError{cudaSuccess};
+    for (size_t i = 0; i < npoints; ++i) {
+        const uint8_t* byt = reinterpret_cast<const uint8_t*>(&scalars[i]);
+        auto d = pasta_msm::glv_split(byt);
+        affine_t P1 = points_[i];
+        affine_t P2;
+        pasta_msm::transform_point_glv(P1, P2);
+        const long long unsigned int init1[4]={(uint64_t(d.first.k[1])<<32)+d.first.k[0],(uint64_t(d.first.k[3])<<32)+d.first.k[2],0,0};
+        scalar_t k1(init1); //k1.from();
+        P1.cneg(d.first.is_negative);
+        const long long unsigned int init2[4]={(uint64_t(d.second.k[1])<<32)+d.second.k[0],(uint64_t(d.second.k[3])<<32)+d.second.k[2],0,0};
+        scalar_t k2(init2); //k2.from();
+        P2.cneg(d.second.is_negative);
+        glv_scalars[2 * i]     = k1;
+        glv_scalars[2 * i + 1] = k2;
+        glv_points[2 * i]      = P1;
+        glv_points[2 * i + 1]  = P2;
     }
+
+    npoints *= 2; // Update number of scalars/points after GLV
+
+    uint32_t lg_npoints = lg2(npoints + npoints / 2);
+    size_t batch = 1 << (std::max(lg_npoints, wbits) - wbits);
+    batch >>= 6;
+    batch = batch ? batch : 1;
+    uint32_t stride = (npoints + batch - 1) / batch;
+    stride = (stride + WARP_SZ - 1) & ((size_t)0 - WARP_SZ);
+
+    std::vector<result_t> res(nwins);
+    std::vector<bucket_t> ones(gpu.sm_count() * BATCH_ADD_BLOCK_SIZE / WARP_SZ);
+
+    out.inf();
+    point_t p;
+
+    try {
+        size_t temp_sz = stride * std::max(2 * sizeof(uint2), sizeof(scalar_t));
+        size_t d_point_sz = (batch > 1 ? 2 * stride : stride) * sizeof(affine_h);
+        size_t digits_sz = nwins * stride * sizeof(uint32_t);
+
+        dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
+
+        vec2d_t<uint2> d_temps{&d_temp[0], stride};
+        vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
+
+        scalar_t* d_scalars = (scalar_t*)&d_temp[0];
+        affine_h* d_points = (affine_h*)&d_temp[temp_sz + digits_sz];
+
+        size_t d_off = 0;
+        size_t h_off = 0;
+        size_t num = std::min(static_cast<size_t>(stride), npoints);
+
+        event_t ev;
+
+        gpu[2].HtoD(&d_scalars[d_off], &glv_scalars[h_off], num);
+        digits(&d_scalars[0], num, d_digits, d_temps, mont);
+        gpu[2].record(ev);
+
+        gpu[0].HtoD(&d_points[d_off], &glv_points[h_off], num, ffi_affine_sz);
+
+        for (uint32_t i = 0; i < batch; i++) {
+            gpu[i & 1].wait(ev);
+
+            batch_addition<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
+                &d_buckets[nwins << (wbits - 1)], &d_points[d_off], num,
+                &d_digits[0][0], d_hist[0][0]
+            );
+            CUDA_OK(cudaGetLastError());
+
+            gpu[i & 1].launch_coop(accumulate<bucket_t, affine_h>,
+                {gpu.sm_count(), 0},
+                d_buckets, nwins, wbits, &d_points[d_off], d_digits, d_hist, i & 1
+            );
+            gpu[i & 1].record(ev);
+
+            integrate<bucket_t><<<nwins, MSM_NTHREADS,
+                                  sizeof(bucket_t) * MSM_NTHREADS / bucket_t::degree,
+                                  gpu[i & 1]>>>(
+                d_buckets, nwins, wbits, scalar_t::bit_length()
+            );
+            CUDA_OK(cudaGetLastError());
+
+            if (i < batch - 1) {
+                h_off += stride;
+                num = std::min(static_cast<size_t>(stride), npoints - h_off);
+
+                gpu[2].HtoD(&d_scalars[0], &glv_scalars[h_off], num);
+                gpu[2].wait(ev);
+                digits(&d_scalars[0], num, d_digits, d_temps, mont);
+                gpu[2].record(ev);
+
+                size_t j = (i + 1) & 1;
+                d_off = j ? stride : 0;
+                gpu[j].HtoD(&d_points[d_off], &glv_points[h_off], num, ffi_affine_sz);
+            } else {
+                d_off = 0;
+            }
+
+            if (i > 0) {
+                collect(p, res, ones);
+                out.add(p);
+            }
+
+            gpu[i & 1].DtoH(ones, d_buckets + (nwins << (wbits - 1)));
+            gpu[i & 1].DtoH(res, d_buckets, sizeof(bucket_h) << (wbits - 1));
+            gpu[i & 1].sync();
+        }
+    } catch (const cuda_error& e) {
+        gpu.sync();
+#ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
+        return RustError{e.code(), e.what()};
+#else
+        return RustError{e.code()};
+#endif
+    }
+
+    collect(p, res, ones);
+    out.add(p);
+
+    return RustError{cudaSuccess};
+}
+
 
 #if 0
     RustError invoke(point_t& out, const affine_t* points, size_t npoints,

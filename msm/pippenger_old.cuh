@@ -112,6 +112,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
             if (wval) wval ^= msb;
             digits[win][i] = wval;
         }
+        
 
         uint32_t wval = s[0] << 1;
         wval = booth_encode(wval, wmask, wbits);

@@ -62,7 +62,7 @@ public:
 
 inline __host__ __device__
 std::pair<DecomposedScalar, DecomposedScalar>
-glv_split(uint8_t v[32]) {
+glv_split(const uint8_t v[32]) {
     uint32_t kl[8];
     uint32_t k1_limbs[8], k2_limbs[8] = {0};
 
