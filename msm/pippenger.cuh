@@ -51,16 +51,15 @@ public:
 
 template<class scalar_t>
 __device__ __forceinline__
-static uint32_t get_wval(const scalar_t&scalar, uint32_t off,
+static uint32_t get_wval(const scalar_T<scalar_t>& scalar, uint32_t off,
                          uint32_t top_i = (scalar_t::nbits + 31) / 32 - 1)
-
 {
     uint32_t i = off / 32;
     uint64_t ret = scalar[i];
 
     if (i < top_i)
         ret |= (uint64_t)scalar[i+1] << 32;
-    //printf("get_wval: off %u, i %u, top_i %u, ret %016lx, scalar: %016lx, off: %016lx\n", off, i, top_i, ret, scalar[i], ret >> (off%32));
+
     return ret >> (off%32);
 }
 
@@ -86,7 +85,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
     const uint32_t tix = threadIdx.x + blockIdx.x*blockDim.x;
 
     const uint32_t top_i = (scalar_t::nbits + 31) / 32 - 1;
-    const uint32_t wmask = 0xffffffffU >> (31-wbits); // (1U << (wbits+1)) - 1; //
+    const uint32_t wmask = 0xffffffffU >> (31-wbits); // (1U << (wbits+1)) - 1;
 
     auto& scalar = xchange[tid/WARP_SZ](tid%WARP_SZ);
 
@@ -94,58 +93,22 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
     for (uint32_t i = tix; i < (uint32_t)len; i += gridDim.x*blockDim.x) {
         auto s = scalars[i];
 
-#if 0
-        s.from();
-        if (!mont) s.to();
-#else
-        if (mont) s.from();
-#endif
 
         // clear the most significant bit
         uint32_t msb = s.abs();
         msb <<= 31;
+
         scalar = s;
-
-        if (i == 0 && tix == 0) {
-            const uint8_t* byt = reinterpret_cast<const uint8_t*>(&scalars[i]);
-            for(int j=0;j<8;++j){
-                printf("%08x ",(uint32_t(byt[j*4+3])<<24)+(uint32_t(byt[j*4+2])<<16)+(uint32_t(byt[j*4+1])<<8)+uint32_t(byt[j*4]));
-            }
-            printf("\n");
-            const uint8_t* byt2 = reinterpret_cast<const uint8_t*>(&scalar);
-            for(int j=0;j<8;++j){
-                printf("%08x ",(uint32_t(byt2[j*4+3])<<24)+(uint32_t(byt2[j*4+2])<<16)+(uint32_t(byt2[j*4+1])<<8)+uint32_t(byt2[j*4]));
-            }
-            printf("\n");
-            printf("\n--- TRACE FOR SCALAR 0 (nwins=%u, wbits=%u) ---\n", nwins, wbits);
-            
-            printf("  Full Scalar limbs [7...0]: %08x %08x %08x %08x %08x %08x %08x %08x\n", 
-                   s[7], s[6], s[5], s[4], s[3], s[2], s[1], s[0]);
-            printf("  Sign bit determined from absolute bit %u is: 0x%08x\n", msb);
-            printf("--------------------------------------------------------------------------\n");
-        }
-
         #pragma unroll 1
         for (uint32_t bit0 = nwins*wbits - 1, win = nwins; --win;) {
             bit0 -= wbits;
-            //uint32_t wval2 = (s[win/2] >> (win%2 * 16)) & 0xffff;
             uint32_t wval = get_wval(scalar, bit0, top_i);
-            if (i == 0 && tix == 0) {
-                printf("  win %u, bit0 %u, wval %08x\n", win, bit0, wval);
-            }
             wval = booth_encode(wval, wmask, wbits);
             if (wval) wval ^= msb;
             digits[win][i] = wval;
-            if (i == 0 && tix == 0) {
-                printf("  win %u, bit0 %u, wval %08x\n", win, bit0, wval);
-            }
         }
 
         uint32_t wval = s[0] << 1;
-        //uint32_t wval2 = (s[0]) & 0xffff;
-        if(i == 0 && tix == 0) {
-            printf("  win %u, bit0 %u, wval %08x\n", nwins-1, 0, wval);
-        }
         wval = booth_encode(wval, wmask, wbits);
         if (wval) wval ^= msb;
         digits[0][i] = wval;
@@ -386,7 +349,10 @@ public:
         npoints = (np+WARP_SZ-1) & ((size_t)0-WARP_SZ);
 
         wbits = 16;
-        nwins = 8;
+        nwins = 9;
+        //Working combinations [13,11] , [10,14], [16,16]
+
+
 
         uint32_t row_sz = 1U << (wbits-1);
 
@@ -487,17 +453,16 @@ public:
         affine_t P2;
         pasta_msm::transform_point_glv(P1, P2);
         const long long unsigned int init1[4]={(uint64_t(d.first.k[1])<<32)+d.first.k[0],(uint64_t(d.first.k[3])<<32)+d.first.k[2],0,0};
-        scalar_t k1(init1); //k1.from();
+        scalar_t k1(init1);
         P1.cneg(d.first.is_negative);
         const long long unsigned int init2[4]={(uint64_t(d.second.k[1])<<32)+d.second.k[0],(uint64_t(d.second.k[3])<<32)+d.second.k[2],0,0};
-        scalar_t k2(init2); //k2.from();
+        scalar_t k2(init2);
         P2.cneg(d.second.is_negative);
         glv_scalars[2 * i]     = k1;
         glv_scalars[2 * i + 1] = k2;
         glv_points[2 * i]      = P1;
         glv_points[2 * i + 1]  = P2;
     }
-
     npoints *= 2; // Update number of scalars/points after GLV
 
     uint32_t lg_npoints = lg2(npoints + npoints / 2);
