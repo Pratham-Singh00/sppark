@@ -350,9 +350,6 @@ public:
 
         wbits = 16;
         nwins = 9;
-        //Working combinations [13,11] , [10,14], [16,16]
-
-
 
         uint32_t row_sz = 1U << (wbits-1);
 
@@ -447,7 +444,9 @@ public:
     std::vector<affine_t> glv_points(2 * npoints);
 
     for (size_t i = 0; i < npoints; ++i) {
-        const uint8_t* byt = reinterpret_cast<const uint8_t*>(&scalars[i]);
+        scalar_t tmp(scalars[i]);
+        tmp.from();
+        const uint8_t* byt = reinterpret_cast<const uint8_t*>(&tmp);
         auto d = pasta_msm::glv_split(byt);
         affine_t P1 = points_[i];
         affine_t P2;
