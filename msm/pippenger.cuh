@@ -183,15 +183,15 @@ void decompose_scalars_and_negate_points_kernel(
 #ifndef LARGE_L1_CODE_CACHE
 # if __CUDA_ARCH__-0 >= 800
 #  define LARGE_L1_CODE_CACHE 1
-#  define ACCUMULATE_NTHREADS 384
+#  define ACCUMULATE_NTHREADS 512
 # else
 #  define LARGE_L1_CODE_CACHE 0
-#  define ACCUMULATE_NTHREADS (bucket_t::degree == 1 ? 384 : 256)
+#  define ACCUMULATE_NTHREADS (bucket_t::degree == 1 ? 512 : 256)
 # endif
 #endif
 
 #ifndef MSM_NTHREADS
-# define MSM_NTHREADS 256
+# define MSM_NTHREADS 128
 #endif
 #if MSM_NTHREADS < 32 || (MSM_NTHREADS & (MSM_NTHREADS-1)) != 0
 # error "bad MSM_NTHREADS value"
