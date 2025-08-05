@@ -363,7 +363,11 @@ void accumulate<bucket_t, affine_t::mem_t>(bucket_t::mem_t buckets_[],
                                            const vec2d_t<uint32_t> histogram,
                                            uint32_t sid);
 template __global__
-void batch_addition<bucket_t>(bucket_t::mem_t buckets[],
+void batch_addition1<bucket_t>(bucket_t::mem_t buckets[],
+                              const affine_t::mem_t points[], size_t npoints,
+                              const uint32_t digits[], const uint32_t& ndigits);
+                              template __global__
+void batch_addition2<bucket_t>(bucket_t::mem_t buckets[],
                               const affine_t::mem_t points[], size_t npoints,
                               const uint32_t digits[], const uint32_t& ndigits);
 template __global__
@@ -485,9 +489,13 @@ public:
             initialize_device_constants();
             constants_initialized = true;
         }
-
-        wbits = 16;
-        nwins = 9;
+        size_t npoints = (np+WARP_SZ-1) & ((size_t)0-WARP_SZ);
+        if(npoints<=(1<<16)){
+            wbits = 13; nwins = 11;
+        }
+        else {
+            wbits = 16; nwins = 9;
+        }
         
         uint32_t row_sz = 1U << (wbits-1);
         size_t d_buckets_sz = (nwins * row_sz)
@@ -631,10 +639,18 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
             gpu[i & 1].wait(ev);
             size_t d_off = (i & 1) ? stride : 0;
 
-            batch_addition<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
+            if(npoints<(1<<18)&&npoints>(1<<16)){
+                batch_addition1<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
                 &d_buckets[nwins << (wbits - 1)], &d_points_batch[d_off], num,
                 &d_digits[0][0], d_hist[0][0]
-            );
+                );
+            }
+            else {
+                batch_addition2<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
+                &d_buckets[nwins << (wbits - 1)], &d_points_batch[d_off], num,
+                &d_digits[0][0], d_hist[0][0]
+                );
+            }
             CUDA_OK(cudaGetLastError());
 
             gpu[i & 1].launch_coop(accumulate<bucket_t, affine_h>,
