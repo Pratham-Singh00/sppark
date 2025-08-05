@@ -639,7 +639,7 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
             gpu[i & 1].wait(ev);
             size_t d_off = (i & 1) ? stride : 0;
 
-            if(npoints<(1<<18)&&npoints>(1<<16)){
+            if(npoints<=(1<<19)&&npoints>(1<<16)){
                 batch_addition1<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
                 &d_buckets[nwins << (wbits - 1)], &d_points_batch[d_off], num,
                 &d_digits[0][0], d_hist[0][0]
