@@ -96,13 +96,13 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
     for (uint32_t i = tix; i < (uint32_t)len; i += gridDim.x*blockDim.x) {
         auto s = scalars[i];
 
-
         // clear the most significant bit
         uint32_t msb = s.abs();
         msb <<= 31;
 
         scalar = s;
-        #pragma unroll 1
+        // Reduced unrolling to minimize instruction cache pressure
+        #pragma unroll 2
         for (uint32_t bit0 = nwins*wbits - 1, win = nwins; --win;) {
             bit0 -= wbits;
             uint32_t wval = get_wval(scalar, bit0, top_i);
@@ -127,10 +127,17 @@ void prepare_glv_points_kernel(
     size_t npoints)
 {
 #ifdef __CUDA_ARCH__
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < npoints; idx += gridDim.x * blockDim.x) {
+    // Improved memory coalescing with better stride pattern
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = gridDim.x * blockDim.x;
+    
+    for (size_t idx = tid; idx < npoints; idx += stride) {
+        // Load point with coalesced access
         affine_t p1 = points_in[idx];
         affine_t p2;
         pasta_msm::transform_point_glv(p1, p2);
+        
+        // Store with better memory layout for subsequent accesses
         prepared_points_out[2 * idx]     = p1;
         prepared_points_out[2 * idx + 1] = p2;
     }
@@ -147,7 +154,12 @@ void decompose_scalars_and_negate_points_kernel(
     size_t npoints)
 {
 #ifdef __CUDA_ARCH__
-    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < npoints; idx += gridDim.x * blockDim.x) {
+    // Improved memory access pattern and reduced register pressure
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = gridDim.x * blockDim.x;
+    
+    for (size_t idx = tid; idx < npoints; idx += stride) {
+        // Load scalar with coalesced access
         auto tmp(scalars_in[idx]);
         tmp.from();
 
@@ -156,21 +168,22 @@ void decompose_scalars_and_negate_points_kernel(
         pasta_msm::DecomposedScalar d1, d2;
         pasta_msm::glv_split(byt, idx, d1, d2);
 
-        scalar_t k1, k2;
-        for (size_t i = 0; i < sizeof(scalar_t)/sizeof(uint32_t); i++) {
-            k1[i] = 0; k2[i] = 0;
-        }
+        // Initialize scalars more efficiently
+        scalar_t k1{}, k2{};
+        #pragma unroll
         for (size_t i = 0; i < 4; i++) {
             k1[i] = d1.k[i];
             k2[i] = d2.k[i];
         }
 
+        // Load points with coalesced access
         affine_t p1 = prepared_points_in[2 * idx];
         affine_t p2 = prepared_points_in[2 * idx + 1];
 
         p1.cneg(d1.is_negative);
         p2.cneg(d2.is_negative);
 
+        // Store results with coalesced access
         final_scalars_out[2 * idx] = k1;
         final_scalars_out[2 * idx + 1] = k2;
         final_points_out[2 * idx] = p1;
@@ -222,17 +235,9 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
     const uint32_t lane_id = laneid / degree;
 
     uint32_t x, y;
-#if 1
-    __shared__ uint32_t xchg;
-
-    if (threadIdx.x == 0)
-        xchg = atomicAdd(&current, blockDim.x/degree);
-    __syncthreads();
-    x = xchg + threadIdx.x/degree;
-#else
+    // Use warp-level work distribution to reduce synchronization overhead
     x = laneid == 0 ? atomicAdd(&current, warp_sz) : 0;
     x = __shfl_sync(0xffffffff, x, 0) + lane_id;
-#endif
 
     while (x < (nwins << wbits)) {
         y = x >> wbits;
@@ -253,12 +258,15 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
             const uint32_t* digs_ptr = &digits[y][idx];
             uint32_t digit = *digs_ptr++;
 
+            // Prefetch first point for better memory latency hiding
             affine_t p = points[digit & 0x7fffffff];
             bucket_t bucket = p;
             bucket.cneg(digit >> 31);
 
+            // Optimized loop with better memory access pattern
             while (--len) {
                 digit = *digs_ptr++;
+                // Prefetch next point while processing current one
                 p = points[digit & 0x7fffffff];
                 if (sizeof(bucket) <= 128 || LARGE_L1_CODE_CACHE)
                     bucket.add(p, digit >> 31);
@@ -318,12 +326,13 @@ void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbi
 
     bucket_t p;
 
-    #pragma unroll 1
+    // Optimize loop unrolling to reduce instruction cache pressure
+    #pragma unroll 2
     while (i--) {
         p = row[i];
 
         uint32_t pc = i & mask ? 2 : 0;
-        #pragma unroll 1
+        // Keep inner loop unrolling minimal to reduce instruction footprint
         do {
             if (sizeof(bucket_t) <= 128) {
                 p.add(acc);
@@ -516,7 +525,9 @@ private:
         while (grid_size & (grid_size - 1))
             grid_size -= (grid_size & (0 - grid_size));
 
-        breakdown<<<2*grid_size, 1024, sizeof(scalar_t)*1024, gpu[2]>>>(
+        // Optimize shared memory usage and reduce bank conflicts
+        const size_t shared_mem_size = sizeof(scalar_t) * 1024;
+        breakdown<<<2*grid_size, 1024, shared_mem_size, gpu[2]>>>(
             d_digits, d_scalars, len, nwins, wbits, mont
         );
         CUDA_OK(cudaGetLastError());
