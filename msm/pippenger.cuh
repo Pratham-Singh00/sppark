@@ -8,14 +8,17 @@
 #include <cuda.h>
 #include <cooperative_groups.h>
 #include <cassert>
+#include <vector>
 
 #include <util/vec2d_t.hpp>
 #include <util/slice_t.hpp>
+#include <util/exception.cuh>
+#include <util/rusterror.h>
+#include <util/gpu_t.cuh>
 
 #include "sort.cuh"
 #include "batch_addition.cuh"
 #include "glv.hpp"
-// #include "glv_constants.cu"
 #include "../ec/affine_t.hpp"
 
 
@@ -28,13 +31,9 @@
 # define asm asm volatile
 #endif
 
-
-// #define Coarse_GLV_Threads 
-
 /*
  * Break down |scalars| to signed |wbits|-wide digits.
  */
-
 #ifdef __CUDA_ARCH__
 // Transposed scalar_t
 template<class scalar_t>
@@ -120,47 +119,62 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 #endif
 }
 
+template<class affine_t>
+__launch_bounds__(256) __global__
+void prepare_glv_points_kernel(
+    const affine_t* points_in,
+    affine_t* prepared_points_out,
+    size_t npoints)
+{
+#ifdef __CUDA_ARCH__
+    for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < npoints; idx += gridDim.x * blockDim.x) {
+        affine_t p1 = points_in[idx];
+        affine_t p2;
+        pasta_msm::transform_point_glv(p1, p2);
+        prepared_points_out[2 * idx]     = p1;
+        prepared_points_out[2 * idx + 1] = p2;
+    }
+#endif
+}
+
 template<class scalar_t, class affine_t>
 __launch_bounds__(256) __global__
-void glv_decomposition_kernel(
-    const scalar_t* scalars,
-    const affine_t* points_in,
-    scalar_t* glv_scalars_out,
-    affine_t* glv_points_out,
-    size_t npoints
-) {
+void decompose_scalars_and_negate_points_kernel(
+    const scalar_t* scalars_in,
+    const affine_t* prepared_points_in, 
+    scalar_t* final_scalars_out,       
+    affine_t* final_points_out,         
+    size_t npoints)
+{
 #ifdef __CUDA_ARCH__
-    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < npoints; idx += gridDim.x * blockDim.x) {
-    auto tmp(scalars[idx]); 
-    tmp.from();
+        auto tmp(scalars_in[idx]);
+        tmp.from();
 
-    const uint8_t* byt = reinterpret_cast<const uint8_t*>(&tmp);
-   
-    pasta_msm::DecomposedScalar d1, d2;
-    pasta_msm::glv_split(byt, idx, d1, d2);
+        const uint8_t* byt = reinterpret_cast<const uint8_t*>(&tmp);
 
-    affine_t P1 = points_in[idx];
-    affine_t P2;
-    pasta_msm::transform_point_glv(P1, P2);
+        pasta_msm::DecomposedScalar d1, d2;
+        pasta_msm::glv_split(byt, idx, d1, d2);
 
-    scalar_t k1, k2;
-    for (size_t i = 0; i < sizeof(scalar_t)/sizeof(uint32_t); i++) {
-        k1[i] = 0;
-        k2[i] = 0;
-    }
-    for (size_t i = 0; i < 4; i++) {
-        k1[i] = d1.k[i];
-        k2[i] = d2.k[i];
-    }
-    
-    P1.cneg(d1.is_negative);
-    P2.cneg(d2.is_negative);
+        scalar_t k1, k2;
+        for (size_t i = 0; i < sizeof(scalar_t)/sizeof(uint32_t); i++) {
+            k1[i] = 0; k2[i] = 0;
+        }
+        for (size_t i = 0; i < 4; i++) {
+            k1[i] = d1.k[i];
+            k2[i] = d2.k[i];
+        }
 
-    glv_scalars_out[2 * idx] = k1;
-    glv_scalars_out[2 * idx + 1] = k2;
-    glv_points_out[2 * idx] = P1;
-    glv_points_out[2 * idx + 1] = P2;
+        affine_t p1 = prepared_points_in[2 * idx];
+        affine_t p2 = prepared_points_in[2 * idx + 1];
+
+        p1.cneg(d1.is_negative);
+        p2.cneg(d2.is_negative);
+
+        final_scalars_out[2 * idx] = k1;
+        final_scalars_out[2 * idx + 1] = k2;
+        final_points_out[2 * idx] = p1;
+        final_points_out[2 * idx + 1] = p2;
     }
 #endif
 }
@@ -359,11 +373,16 @@ template __global__
 void breakdown<scalar_t>(vec2d_t<uint32_t> digits, const scalar_t scalars[],
                          size_t len, uint32_t nwins, uint32_t wbits, bool mont);
 template __global__
-void glv_decomposition_kernel<scalar_t, affine_t>(
-    const scalar_t* scalars,
+void prepare_glv_points_kernel<affine_t>(
     const affine_t* points_in,
-    scalar_t* glv_scalars_out,
-    affine_t* glv_points_out,
+    affine_t* prepared_points_out,
+    size_t npoints);
+template __global__
+void decompose_scalars_and_negate_points_kernel<scalar_t, affine_t>(
+    const scalar_t* scalars_in,
+    const affine_t* prepared_points_in,
+    scalar_t* final_scalars_out,
+    affine_t* final_points_out,
     size_t npoints
 );
 #endif
@@ -373,17 +392,38 @@ void glv_decomposition_kernel<scalar_t, affine_t>(
 #include <util/rusterror.h>
 #include <util/gpu_t.cuh>
 
+template<class affine_h>
+struct point_precomputation_cache {
+    static affine_h* s_d_prepared_points;
+    static size_t s_original_npoints;
+};
+
+template<class affine_h> affine_h* point_precomputation_cache<affine_h>::s_d_prepared_points = nullptr;
+template<class affine_h> size_t point_precomputation_cache<affine_h>::s_original_npoints = 0;
+
+template<class scalar_t, class affine_h>
+struct pipeline_cache {
+    static affine_h* s_d_final_points;
+    static scalar_t* s_d_final_scalars;
+    static size_t s_original_npoints;
+};
+
+template<class scalar_t, class affine_h> affine_h* pipeline_cache<scalar_t, affine_h>::s_d_final_points = nullptr;
+template<class scalar_t, class affine_h> scalar_t* pipeline_cache<scalar_t, affine_h>::s_d_final_scalars = nullptr;
+template<class scalar_t, class affine_h> size_t pipeline_cache<scalar_t, affine_h>::s_original_npoints = 0;
+
+
 template<class bucket_t, class point_t, class affine_t, class scalar_t,
          class affine_h = class affine_t::mem_t,
          class bucket_h = class bucket_t::mem_t>
 class msm_t {
     const gpu_t& gpu;
-    size_t npoints;
     uint32_t wbits, nwins;
     bucket_h *d_buckets;
-    affine_h *d_points;
-    scalar_t *d_scalars;
     vec2d_t<uint32_t> d_hist;
+
+    using point_cache_t = point_precomputation_cache<affine_h>;
+    using pipeline_cache_t = pipeline_cache<scalar_t, affine_h>;
 
     template<typename T> using vec_t = slice_t<T>;
 
@@ -404,57 +444,62 @@ public:
         cudaError_t err;
         err = cudaMemcpyToSymbol(pasta_msm::g1, pasta_msm::GLVHostConstants::h_g1, sizeof(pasta_msm::g1));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for g1\n"); }
-
         err = cudaMemcpyToSymbol(pasta_msm::g2, pasta_msm::GLVHostConstants::h_g2, sizeof(pasta_msm::g2));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for g2\n"); }
-
         err = cudaMemcpyToSymbol(pasta_msm::Pallas_a1, pasta_msm::GLVHostConstants::h_Pallas_a1, sizeof(pasta_msm::Pallas_a1));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for Pallas_a1\n"); }
-        
         err = cudaMemcpyToSymbol(pasta_msm::Pallas_a2, pasta_msm::GLVHostConstants::h_Pallas_a2, sizeof(pasta_msm::Pallas_a2));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for Pallas_a2\n"); }
-        
         err = cudaMemcpyToSymbol(pasta_msm::Pallas_b1, pasta_msm::GLVHostConstants::h_Pallas_b1, sizeof(pasta_msm::Pallas_b1));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for Pallas_b1\n"); }
-
         err = cudaMemcpyToSymbol(pasta_msm::Pallas_b2, pasta_msm::GLVHostConstants::h_Pallas_b2, sizeof(pasta_msm::Pallas_b2));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for Pallas_b2\n"); }
-
         err = cudaMemcpyToSymbol(pasta_msm::beta2, pasta_msm::GLVHostConstants::h_beta2, sizeof(pasta_msm::beta2));
         if (err != cudaSuccess) { printf("ERROR: cudaMemcpyToSymbol failed for beta2\n"); }
     }
+
+    static void cleanup_msm_caches() {
+        if (point_cache_t::s_d_prepared_points != nullptr) {
+            cudaFree(point_cache_t::s_d_prepared_points);
+            point_cache_t::s_d_prepared_points = nullptr;
+        }
+        point_cache_t::s_original_npoints = 0;
+        
+        if (pipeline_cache_t::s_d_final_scalars != nullptr) {
+            cudaFree(pipeline_cache_t::s_d_final_scalars);
+            pipeline_cache_t::s_d_final_scalars = nullptr;
+        }
+        if (pipeline_cache_t::s_d_final_points != nullptr) {
+            cudaFree(pipeline_cache_t::s_d_final_points);
+            pipeline_cache_t::s_d_final_points = nullptr;
+        }
+        pipeline_cache_t::s_original_npoints = 0;
+    }
+
     msm_t(const affine_t points[], size_t np,
           size_t ffi_affine_sz = sizeof(affine_t), int device_id = -1)
-        : gpu(select_gpu(device_id)), d_points(nullptr), d_scalars(nullptr)
+        : gpu(select_gpu(device_id))
     {
-        initialize_device_constants();
-        npoints = (np+WARP_SZ-1) & ((size_t)0-WARP_SZ);
-    
+        static bool constants_initialized = false;
+        if (!constants_initialized) {
+            initialize_device_constants();
+            constants_initialized = true;
+        }
+
         wbits = 16;
         nwins = 9;
-
+        
         uint32_t row_sz = 1U << (wbits-1);
-
         size_t d_buckets_sz = (nwins * row_sz)
                             + (gpu.sm_count() * BATCH_ADD_BLOCK_SIZE / WARP_SZ);
         size_t d_blob_sz = (d_buckets_sz * sizeof(d_buckets[0]))
-                         + (nwins * row_sz * sizeof(uint32_t))
-                         + (points ? npoints * sizeof(d_points[0]) : 0);
-
+                         + (nwins * row_sz * sizeof(uint32_t));
         d_buckets = reinterpret_cast<decltype(d_buckets)>(gpu.Dmalloc(d_blob_sz));
         d_hist = vec2d_t<uint32_t>(&d_buckets[d_buckets_sz], row_sz);
-        if (points) {
-            d_points = reinterpret_cast<decltype(d_points)>(d_hist[nwins]);
-            gpu.HtoD(d_points, points, np, ffi_affine_sz);
-            npoints = np;
-        } else {
-            npoints = 0;
-        }
-
     }
     inline msm_t(vec_t<affine_t> points, size_t ffi_affine_sz = sizeof(affine_t),
                  int device_id = -1)
-        : msm_t(points, points.size(), ffi_affine_sz, device_id) {};
+        : msm_t(points.data(), points.size(), ffi_affine_sz, device_id) {};
     inline msm_t(int device_id = -1)
         : msm_t(nullptr, 0, 0, device_id) {};
     ~msm_t()
@@ -467,13 +512,6 @@ private:
     void digits(const scalar_t d_scalars[], size_t len,
                 vec2d_t<uint32_t>& d_digits, vec2d_t<uint2>&d_temps, bool mont)
     {
-        // Using larger grid size doesn't make 'sort' run faster, actually
-        // quite contrary. Arguably because global memory bus gets
-        // thrashed... Stepping far outside the sweet spot has significant
-        // impact, 30-40% degradation was observed. It's assumed that all
-        // GPUs are "balanced" in an approximately the same manner. The
-        // coefficient was observed to deliver optimal performance on
-        // Turing and Ampere...
         uint32_t grid_size = gpu.sm_count() / 3;
         while (grid_size & (grid_size - 1))
             grid_size -= (grid_size & (0 - grid_size));
@@ -482,20 +520,7 @@ private:
             d_digits, d_scalars, len, nwins, wbits, mont
         );
         CUDA_OK(cudaGetLastError());
-
         const size_t shared_sz = sizeof(uint32_t) << DIGIT_BITS;
-#if 0
-        uint32_t win;
-        for (win = 0; win < nwins-1; win++) {
-            gpu[2].launch_coop(sort, {grid_size, SORT_BLOCKDIM, shared_sz},
-                            d_digits, len, win, d_temps, d_hist,
-                            wbits-1, wbits-1, 0u);
-        }
-        uint32_t top = size_t(143) - wbits * win;
-        gpu[2].launch_coop(sort, {grid_size, SORT_BLOCKDIM, shared_sz},
-                            d_digits, len, win, d_temps, d_hist,
-                            wbits-1, top-1, 0u);
-#else
         uint32_t top = size_t(143) - wbits * (nwins-1);
         uint32_t win;
         for (win = 0; win < nwins-1; win += 2) {
@@ -508,56 +533,64 @@ private:
                             d_digits, len, win, d_temps, d_hist,
                             wbits-1, top-1, 0u);
         }
-#endif
     }
 public:
-RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
+RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
                  const scalar_t* scalars, bool mont = true,
                  size_t ffi_affine_sz = sizeof(affine_t))
 {
-    assert(this->npoints == 0 || npoints <= this->npoints);
-
-    scalar_t* d_input_scalars = nullptr;
-    affine_t* d_input_points = nullptr;
-    scalar_t* d_glv_scalars = nullptr;
-    affine_t* d_glv_points = nullptr;
-
     try {
-        if (npoints == 0) {
-            printf("No points to process.\n");
+        if (npoints_in == 0) {
             out.inf();
             return RustError{cudaSuccess};
         }
-        // std::vector<scalar_t> glv_scalars(2 * npoints);
-        // std::vector<affine_t> glv_points(2 * npoints);
 
-        CUDA_OK(cudaMalloc(&d_input_scalars, npoints * sizeof(scalar_t)));
-        CUDA_OK(cudaMalloc(&d_input_points, npoints * sizeof(affine_t)));
-        CUDA_OK(cudaMalloc(&d_glv_scalars, 2 * npoints * sizeof(scalar_t)));
-        CUDA_OK(cudaMalloc(&d_glv_points, 2 * npoints * sizeof(affine_t)));
+        if (point_cache_t::s_d_prepared_points == nullptr || point_cache_t::s_original_npoints != npoints_in) {
+            cleanup_msm_caches();
+
+            affine_t* d_input_points_tmp;
+            CUDA_OK(cudaMalloc(&d_input_points_tmp, npoints_in * sizeof(affine_t)));
+            CUDA_OK(cudaMalloc(&point_cache_t::s_d_prepared_points, npoints_in * 2 * sizeof(affine_h)));
+            point_cache_t::s_original_npoints = npoints_in;
+
+            gpu[0].HtoD(d_input_points_tmp, points_, npoints_in, ffi_affine_sz);
+            
+            const uint32_t block_size = 256;
+            const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
+            
+            prepare_glv_points_kernel<affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
+                d_input_points_tmp, (affine_t*)point_cache_t::s_d_prepared_points, npoints_in);
+            CUDA_OK(cudaGetLastError());
+            gpu[0].sync();
+            cudaFree(d_input_points_tmp);
+        }
+
+        if (pipeline_cache_t::s_d_final_scalars == nullptr || pipeline_cache_t::s_original_npoints != npoints_in) {
+            CUDA_OK(cudaMalloc(&pipeline_cache_t::s_d_final_scalars, npoints_in * 2 * sizeof(scalar_t)));
+            CUDA_OK(cudaMalloc(&pipeline_cache_t::s_d_final_points, npoints_in * 2 * sizeof(affine_h)));
+            pipeline_cache_t::s_original_npoints = npoints_in;
+        }
         
-        gpu[0].HtoD(d_input_scalars, scalars, npoints);
-        gpu[0].HtoD(d_input_points, points_, npoints, ffi_affine_sz);
-
+        scalar_t* d_input_scalars_tmp;
+        CUDA_OK(cudaMalloc(&d_input_scalars_tmp, npoints_in * sizeof(scalar_t)));
+        gpu[0].HtoD(d_input_scalars_tmp, scalars, npoints_in);
+        
         const uint32_t block_size = 256;
-        const uint32_t grid_size = (npoints + block_size - 1) / block_size;
-        gpu[0].sync();
-        glv_decomposition_kernel<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
-            d_input_scalars,
-            d_input_points,
-            d_glv_scalars,
-            d_glv_points,
-            npoints
-        );
-        cudaDeviceSynchronize();
+        const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
+        
+        decompose_scalars_and_negate_points_kernel<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
+            d_input_scalars_tmp,
+            (const affine_t*)point_cache_t::s_d_prepared_points,
+            pipeline_cache_t::s_d_final_scalars,
+            (affine_t*)pipeline_cache_t::s_d_final_points,
+            npoints_in);
         CUDA_OK(cudaGetLastError());
-        gpu[0].sync();
+        gpu[0].sync(); 
+        cudaFree(d_input_scalars_tmp);
 
-        // gpu[0].DtoH(glv_scalars.data(), d_glv_scalars, 2 * npoints);
-        // gpu[0].DtoH(glv_points.data(), d_glv_points, 2 * npoints);
-        // gpu[0].sync();
-
-        npoints *= 2;
+        size_t npoints = npoints_in * 2;
+        scalar_t* d_glv_scalars = pipeline_cache_t::s_d_final_scalars;
+        affine_h* d_glv_points = pipeline_cache_t::s_d_final_points;
 
         uint32_t lg_npoints = lg2(npoints + npoints / 2);
         size_t batch = 1 << (std::max(lg_npoints, wbits) - wbits);
@@ -580,7 +613,6 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
 
         vec2d_t<uint2> d_temps{&d_temp[0], stride};
         vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
-
         scalar_t* d_scalars_batch = (scalar_t*)&d_temp[0];
         affine_h* d_points_batch = (affine_h*)&d_temp[temp_sz + digits_sz];
 
@@ -589,11 +621,11 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
 
         event_t ev;
 
-        CUDA_OK(cudaMemcpyAsync(&d_scalars_batch[0], &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
-        digits(&d_scalars_batch[0], num, d_digits, d_temps, mont);
+        CUDA_OK(cudaMemcpyAsync(d_scalars_batch, &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
+        digits(d_scalars_batch, num, d_digits, d_temps, mont);
         gpu[2].record(ev);
 
-        CUDA_OK(cudaMemcpyAsync(&d_points_batch[0], &d_glv_points[d_src_off], num * sizeof(affine_h), cudaMemcpyDeviceToDevice, gpu[0]));
+        CUDA_OK(cudaMemcpyAsync(d_points_batch, &d_glv_points[d_src_off], num * sizeof(affine_h), cudaMemcpyDeviceToDevice, gpu[0]));
 
         for (uint32_t i = 0; i < batch; i++) {
             gpu[i & 1].wait(ev);
@@ -606,7 +638,7 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
             CUDA_OK(cudaGetLastError());
 
             gpu[i & 1].launch_coop(accumulate<bucket_t, affine_h>,
-                {gpu.sm_count(), 0},
+                launch_params_t(gpu.sm_count(), ACCUMULATE_NTHREADS),
                 d_buckets, nwins, wbits, &d_points_batch[d_off], d_digits, d_hist, i & 1
             );
             gpu[i & 1].record(ev);
@@ -622,9 +654,9 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
                 d_src_off += stride;
                 num = std::min(static_cast<size_t>(stride), npoints - d_src_off);
 
-                CUDA_OK(cudaMemcpyAsync(&d_scalars_batch[0], &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
+                CUDA_OK(cudaMemcpyAsync(d_scalars_batch, &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
                 gpu[2].wait(ev);
-                digits(&d_scalars_batch[0], num, d_digits, d_temps, mont);
+                digits(d_scalars_batch, num, d_digits, d_temps, mont);
                 gpu[2].record(ev);
 
                 size_t j = (i + 1) & 1;
@@ -641,22 +673,13 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
             gpu[i & 1].DtoH(res, d_buckets, sizeof(bucket_h) << (wbits - 1));
             gpu[i & 1].sync();
         }
-        
+
         collect(p, res, ones);
         out.add(p);
 
-        cudaFree(d_input_scalars);
-        cudaFree(d_input_points);
-        cudaFree(d_glv_scalars);
-        cudaFree(d_glv_points);
-
         return RustError{cudaSuccess};
-    
+
     } catch (const cuda_error& e) {
-        cudaFree(d_input_scalars);
-        cudaFree(d_input_points);
-        cudaFree(d_glv_scalars);
-        cudaFree(d_glv_points);
         gpu.sync();
 #ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
         return RustError{e.code(), e.what()};
@@ -666,50 +689,15 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
     }
 }
 
-
-    #if 0
-    RustError invoke(point_t& out, const affine_t* points, size_t npoints,
-                                   gpu_ptr_t<scalar_t> scalars, bool mont = true,
-                                   size_t ffi_affine_sz = sizeof(affine_t))
-    {
-        d_scalars = scalars;
-        return invoke(out, points, npoints, nullptr, mont, ffi_affine_sz);
-    }
-    #else
-    template<typename affine_ptr_t = const affine_h*,
-             typename scalar_ptr_t = const scalar_t*>
-    RustError invoke(point_t& out, affine_ptr_t points, size_t npoints,
-                                   scalar_ptr_t scalars, bool mont = true,
-                                   size_t ffi_affine_sz = sizeof(affine_t))
-    {
-        const auto* p_ptr = &points[0];
-        if (is_device_ptr<affine_ptr_t>::value) {
-            d_points = (decltype(d_points))p_ptr;
-            p_ptr = nullptr;
-        }
-
-        const auto* s_ptr = &scalars[0];
-        if (is_device_ptr<scalar_ptr_t>::value) {
-            d_scalars = const_cast<decltype(d_scalars)>(s_ptr);
-            s_ptr = nullptr;
-        }
-
-        return invoke(out, p_ptr, npoints, s_ptr, mont, ffi_affine_sz);
-    }
-    #endif
-
-    RustError invoke(point_t& out, vec_t<scalar_t> scalars, bool mont = true)
-    {   return invoke(out, nullptr, scalars.size(), scalars, mont);   }
-
     RustError invoke(point_t& out, vec_t<affine_t> points,
                                    const scalar_t* scalars, bool mont = true,
                                    size_t ffi_affine_sz = sizeof(affine_t))
-    {   return invoke(out, points, points.size(), scalars, mont, ffi_affine_sz);   }
+    {   return invoke(out, points.data(), points.size(), scalars, mont, ffi_affine_sz);   }
 
     RustError invoke(point_t& out, vec_t<affine_t> points,
                                    vec_t<scalar_t> scalars, bool mont = true,
                                    size_t ffi_affine_sz = sizeof(affine_t))
-    {   return invoke(out, points, points.size(), scalars, mont, ffi_affine_sz);   }
+    {   return invoke(out, points.data(), points.size(), scalars.data(), mont, ffi_affine_sz);   }
 
     RustError invoke(point_t& out, const std::vector<affine_t>& points,
                                    const std::vector<scalar_t>& scalars, bool mont = true,
@@ -724,9 +712,7 @@ private:
     point_t integrate_row(const result_t& row, uint32_t lsbits)
     {
         const int NTHRBITS = lg2(MSM_NTHREADS/bucket_t::degree);
-
         assert(wbits-1 > NTHRBITS);
-
         size_t i = MSM_NTHREADS/bucket_t::degree - 1;
 
         if (lsbits-1 <= NTHRBITS) {
@@ -741,13 +727,11 @@ private:
                 if ((i & mask) == 0)
                     res.add(acc);
             }
-
             return res;
         }
 
         point_t  res = row[i][0];
         bucket_t acc = row[i][1];
-
         while (i--) {
             point_t raise = acc;
             for (size_t j = 0; j < lsbits-1-NTHRBITS; j++)
@@ -757,7 +741,6 @@ private:
             if (i)
                 acc.add(row[i][1]);
         }
-
         return res;
     }
 
@@ -785,7 +768,7 @@ private:
             total++;
         }
 
-        std::vector<std::atomic<size_t>> row_sync(nwins); /* zeroed */
+        std::vector<std::atomic<size_t>> row_sync(nwins);
         counter_t<size_t> counter(0);
         channel_t<size_t> ch;
 
@@ -830,9 +813,8 @@ RustError mult_pippenger(point_t *out, const affine_t points[], size_t npoints,
                                        size_t ffi_affine_sz = sizeof(affine_t))
 {
     try {
-        msm_t<bucket_t, point_t, affine_t, scalar_t> msm{nullptr, npoints};
-        return msm.invoke(*out, slice_t<affine_t>{points, npoints},
-                                scalars, mont, ffi_affine_sz);
+        msm_t<bucket_t, point_t, affine_t, scalar_t> msm(points, npoints, ffi_affine_sz);
+        return msm.invoke(*out, points, npoints, scalars, mont, ffi_affine_sz);
     } catch (const cuda_error& e) {
         out->inf();
 #ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE

@@ -58,9 +58,14 @@ struct DecomposedScalar {
 };
 
 inline __host__ __device__
-void glv_split(const uint8_t v[32], uint32_t thread_idx, 
+void glv_split(const uint8_t v[32], uint32_t thread_idx,
              DecomposedScalar& r1, DecomposedScalar& r2) {
-    #ifdef __CUDA_ARCH__
+#if !defined(__CUDA_ARCH__)
+    (void)v;
+    (void)thread_idx;
+    (void)r1;
+    (void)r2;
+#else
     uint32_t kl[8];
     uint32_t k1_limbs[8] = {0}, k2_limbs[8] = {0};
 
@@ -163,7 +168,7 @@ void glv_split(const uint8_t v[32], uint32_t thread_idx,
     } else {
         for (int i = 0; i < 4; i++) r2.k[i] = k2_limbs[i];
     }
-    #endif
+#endif
 }
 
 template<typename PointT>
