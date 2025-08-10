@@ -119,6 +119,52 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 #endif
 }
 
+template<class scalar_t, class affine_t>
+__launch_bounds__(256) __global__
+void prepare_and_decompose_kernel(
+    const affine_t* points_in,  
+    const scalar_t* scalars_in,  
+    affine_t* final_points_out,   
+    scalar_t* final_scalars_out,     
+    size_t npoints)
+{
+#ifdef __CUDA_ARCH__
+    const size_t idx0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = gridDim.x * blockDim.x;
+    for (size_t idx = idx0; idx < npoints; idx += stride) {
+        affine_t p = points_in[idx];
+        affine_t p_glv;
+        pasta_msm::transform_point_glv(p, p_glv);
+
+        scalar_t s = scalars_in[idx];
+        s.from();
+
+        const uint8_t* byt = reinterpret_cast<const uint8_t*>(&s);
+
+        pasta_msm::DecomposedScalar d1, d2;
+        pasta_msm::glv_split(byt, idx, d1, d2);
+
+        scalar_t k1, k2;
+        for (size_t i = 0; i < sizeof(scalar_t)/sizeof(uint32_t); ++i) {
+            k1[i] = 0;
+            k2[i] = 0;
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            k1[i] = d1.k[i];
+            k2[i] = d2.k[i];
+        }
+
+        p.cneg(d1.is_negative);
+        p_glv.cneg(d2.is_negative);
+
+        final_scalars_out[2*idx]     = k1;
+        final_scalars_out[2*idx + 1] = k2;
+        final_points_out[2*idx]      = p;
+        final_points_out[2*idx + 1]  = p_glv;
+    }
+#endif
+}
+
 template<class affine_t>
 __launch_bounds__(256) __global__
 void prepare_glv_points_kernel(
@@ -141,9 +187,9 @@ template<class scalar_t, class affine_t>
 __launch_bounds__(256) __global__
 void decompose_scalars_and_negate_points_kernel(
     const scalar_t* scalars_in,
-    const affine_t* prepared_points_in, 
-    scalar_t* final_scalars_out,       
-    affine_t* final_points_out,         
+    const affine_t* prepared_points_in,
+    scalar_t* final_scalars_out,
+    affine_t* final_points_out,
     size_t npoints)
 {
 #ifdef __CUDA_ARCH__
@@ -385,6 +431,13 @@ void decompose_scalars_and_negate_points_kernel<scalar_t, affine_t>(
     affine_t* final_points_out,
     size_t npoints
 );
+template __global__
+void prepare_and_decompose_kernel<scalar_t, affine_t>(
+    const affine_t* points_in,
+    const scalar_t* scalars_in,
+    affine_t* final_points_out,
+    scalar_t* final_scalars_out,
+    size_t npoints);
 #endif
 
 #include <vector>
@@ -545,48 +598,36 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
             return RustError{cudaSuccess};
         }
 
-        if (point_cache_t::s_d_prepared_points == nullptr || point_cache_t::s_original_npoints != npoints_in) {
+        if (pipeline_cache_t::s_d_final_scalars == nullptr || pipeline_cache_t::s_original_npoints != npoints_in) {
             cleanup_msm_caches();
 
-            affine_t* d_input_points_tmp;
-            CUDA_OK(cudaMalloc(&d_input_points_tmp, npoints_in * sizeof(affine_t)));
-            CUDA_OK(cudaMalloc(&point_cache_t::s_d_prepared_points, npoints_in * 2 * sizeof(affine_h)));
-            point_cache_t::s_original_npoints = npoints_in;
-
-            gpu[0].HtoD(d_input_points_tmp, points_, npoints_in, ffi_affine_sz);
-            
-            const uint32_t block_size = 256;
-            const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
-            
-            prepare_glv_points_kernel<affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
-                d_input_points_tmp, (affine_t*)point_cache_t::s_d_prepared_points, npoints_in);
-            CUDA_OK(cudaGetLastError());
-            gpu[0].sync();
-            cudaFree(d_input_points_tmp);
-        }
-
-        if (pipeline_cache_t::s_d_final_scalars == nullptr || pipeline_cache_t::s_original_npoints != npoints_in) {
             CUDA_OK(cudaMalloc(&pipeline_cache_t::s_d_final_scalars, npoints_in * 2 * sizeof(scalar_t)));
             CUDA_OK(cudaMalloc(&pipeline_cache_t::s_d_final_points, npoints_in * 2 * sizeof(affine_h)));
             pipeline_cache_t::s_original_npoints = npoints_in;
+
+            affine_t* d_input_points_tmp = nullptr;
+            scalar_t* d_input_scalars_tmp = nullptr;
+            CUDA_OK(cudaMalloc(&d_input_points_tmp, npoints_in * sizeof(affine_t)));
+            CUDA_OK(cudaMalloc(&d_input_scalars_tmp, npoints_in * sizeof(scalar_t)));
+
+            gpu[0].HtoD(d_input_points_tmp, points_, npoints_in, ffi_affine_sz);
+            gpu[0].HtoD(d_input_scalars_tmp, scalars, npoints_in);
+            const uint32_t block_size = 256;
+            const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
+
+            prepare_and_decompose_kernel<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
+                d_input_points_tmp,
+                d_input_scalars_tmp,
+                (affine_t*)pipeline_cache_t::s_d_final_points,
+                pipeline_cache_t::s_d_final_scalars,
+                npoints_in
+            );
+            CUDA_OK(cudaGetLastError());
+            gpu[0].sync();
+
+            CUDA_OK(cudaFree(d_input_points_tmp));
+            CUDA_OK(cudaFree(d_input_scalars_tmp));
         }
-        
-        scalar_t* d_input_scalars_tmp;
-        CUDA_OK(cudaMalloc(&d_input_scalars_tmp, npoints_in * sizeof(scalar_t)));
-        gpu[0].HtoD(d_input_scalars_tmp, scalars, npoints_in);
-        
-        const uint32_t block_size = 256;
-        const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
-        
-        decompose_scalars_and_negate_points_kernel<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
-            d_input_scalars_tmp,
-            (const affine_t*)point_cache_t::s_d_prepared_points,
-            pipeline_cache_t::s_d_final_scalars,
-            (affine_t*)pipeline_cache_t::s_d_final_points,
-            npoints_in);
-        CUDA_OK(cudaGetLastError());
-        gpu[0].sync(); 
-        cudaFree(d_input_scalars_tmp);
 
         size_t npoints = npoints_in * 2;
         scalar_t* d_glv_scalars = pipeline_cache_t::s_d_final_scalars;
