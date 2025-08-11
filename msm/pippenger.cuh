@@ -121,7 +121,7 @@ void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
 
 template<class scalar_t, class affine_t>
 __launch_bounds__(256) __global__
-void prepare_and_decompose_kernel(
+void decompose(
     const affine_t* points_in,  
     const scalar_t* scalars_in,  
     affine_t* final_points_out,   
@@ -167,7 +167,7 @@ void prepare_and_decompose_kernel(
 
 template<class affine_t>
 __launch_bounds__(256) __global__
-void prepare_glv_points_kernel(
+void transform(
     const affine_t* points_in,
     affine_t* prepared_points_out,
     size_t npoints)
@@ -185,7 +185,7 @@ void prepare_glv_points_kernel(
 
 template<class scalar_t, class affine_t>
 __launch_bounds__(256) __global__
-void decompose_scalars_and_negate_points_kernel(
+void glv_split(
     const scalar_t* scalars_in,
     const affine_t* prepared_points_in,
     scalar_t* final_scalars_out,
@@ -419,12 +419,12 @@ template __global__
 void breakdown<scalar_t>(vec2d_t<uint32_t> digits, const scalar_t scalars[],
                          size_t len, uint32_t nwins, uint32_t wbits, bool mont);
 template __global__
-void prepare_glv_points_kernel<affine_t>(
+void transform<affine_t>(
     const affine_t* points_in,
     affine_t* prepared_points_out,
     size_t npoints);
 template __global__
-void decompose_scalars_and_negate_points_kernel<scalar_t, affine_t>(
+void glv_split<scalar_t, affine_t>(
     const scalar_t* scalars_in,
     const affine_t* prepared_points_in,
     scalar_t* final_scalars_out,
@@ -432,7 +432,7 @@ void decompose_scalars_and_negate_points_kernel<scalar_t, affine_t>(
     size_t npoints
 );
 template __global__
-void prepare_and_decompose_kernel<scalar_t, affine_t>(
+void decompose<scalar_t, affine_t>(
     const affine_t* points_in,
     const scalar_t* scalars_in,
     affine_t* final_points_out,
@@ -569,7 +569,7 @@ private:
         while (grid_size & (grid_size - 1))
             grid_size -= (grid_size & (0 - grid_size));
 
-        breakdown<<<2*grid_size, 1024, sizeof(scalar_t)*1024, gpu[2]>>>(
+        breakdown<<<2*grid_size, 512, sizeof(scalar_t)*1024, gpu[2]>>>(
             d_digits, d_scalars, len, nwins, wbits, mont
         );
         CUDA_OK(cudaGetLastError());
@@ -615,7 +615,7 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
             const uint32_t block_size = 256;
             const uint32_t grid_size = (npoints_in + block_size - 1) / block_size;
 
-            prepare_and_decompose_kernel<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
+            decompose<scalar_t, affine_t><<<grid_size, block_size, 0, gpu[0]>>>(
                 d_input_points_tmp,
                 d_input_scalars_tmp,
                 (affine_t*)pipeline_cache_t::s_d_final_points,
