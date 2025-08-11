@@ -529,8 +529,8 @@ public:
         pipeline_cache_t::s_original_npoints = 0;
     }
 
-    msm_t(const affine_t points[], size_t np,
-          size_t ffi_affine_sz = sizeof(affine_t), int device_id = -1)
+    msm_t(const affine_t[] /*points*/, size_t /*np*/,
+          size_t /*ffi_affine_sz*/, int device_id = -1)
         : gpu(select_gpu(device_id))
     {
         static bool constants_initialized = false;
@@ -646,75 +646,66 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
         out.inf();
         point_t p;
 
-        size_t temp_sz = stride * std::max(2 * sizeof(uint2), sizeof(scalar_t));
-        size_t d_point_sz = (batch > 1 ? 2 * stride : stride) * sizeof(affine_h);
+        size_t temp_sz = stride * 2 * sizeof(uint2);
         size_t digits_sz = nwins * stride * sizeof(uint32_t);
-
-        dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
+        dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz, gpu[2]};
 
         vec2d_t<uint2> d_temps{&d_temp[0], stride};
         vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
-        scalar_t* d_scalars_batch = (scalar_t*)&d_temp[0];
-        affine_h* d_points_batch = (affine_h*)&d_temp[temp_sz + digits_sz];
-
+        
         size_t d_src_off = 0;
         size_t num = std::min(static_cast<size_t>(stride), npoints);
 
         event_t ev;
+        event_t dtoh_done[2];
 
-        CUDA_OK(cudaMemcpyAsync(d_scalars_batch, &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
-        digits(d_scalars_batch, num, d_digits, d_temps, mont);
+        digits(&d_glv_scalars[d_src_off], num, d_digits, d_temps, mont);
         gpu[2].record(ev);
 
-        CUDA_OK(cudaMemcpyAsync(d_points_batch, &d_glv_points[d_src_off], num * sizeof(affine_h), cudaMemcpyDeviceToDevice, gpu[0]));
-
         for (uint32_t i = 0; i < batch; i++) {
-            gpu[i & 1].wait(ev);
-            size_t d_off = (i & 1) ? stride : 0;
-
-            batch_addition<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[i & 1]>>>(
-                &d_buckets[nwins << (wbits - 1)], &d_points_batch[d_off], num,
-                &d_digits[0][0], d_hist[0][0]
-            );
-            CUDA_OK(cudaGetLastError());
-
-            gpu[i & 1].launch_coop(accumulate<bucket_t, affine_h>,
-                launch_params_t(gpu.sm_count(), ACCUMULATE_NTHREADS),
-                d_buckets, nwins, wbits, &d_points_batch[d_off], d_digits, d_hist, i & 1
-            );
-            gpu[i & 1].record(ev);
-
-            integrate<bucket_t><<<nwins, MSM_NTHREADS,
-                                  sizeof(bucket_t) * MSM_NTHREADS / bucket_t::degree,
-                                  gpu[i & 1]>>>(
-                d_buckets, nwins, wbits, size_t(143)
-            );
-            CUDA_OK(cudaGetLastError());
-
-            if (i < batch - 1) {
-                d_src_off += stride;
-                num = std::min(static_cast<size_t>(stride), npoints - d_src_off);
-
-                CUDA_OK(cudaMemcpyAsync(d_scalars_batch, &d_glv_scalars[d_src_off], num * sizeof(scalar_t), cudaMemcpyDeviceToDevice, gpu[2]));
-                gpu[2].wait(ev);
-                digits(d_scalars_batch, num, d_digits, d_temps, mont);
-                gpu[2].record(ev);
-
-                size_t j = (i + 1) & 1;
-                d_off = j ? stride : 0;
-                CUDA_OK(cudaMemcpyAsync(&d_points_batch[d_off], &d_glv_points[d_src_off], num * sizeof(affine_h), cudaMemcpyDeviceToDevice, gpu[j]));
-            }
+            int stream_idx = i & 1;
 
             if (i > 0) {
+                cudaEventSynchronize(dtoh_done[(i - 1) & 1]);
                 collect(p, res, ones);
                 out.add(p);
             }
+            
+            gpu[stream_idx].wait(ev);
 
-            gpu[i & 1].DtoH(ones, d_buckets + (nwins << (wbits - 1)));
-            gpu[i & 1].DtoH(res, d_buckets, sizeof(bucket_h) << (wbits - 1));
-            gpu[i & 1].sync();
+            affine_h* d_current_points = &d_glv_points[d_src_off];
+
+            batch_addition<bucket_t><<<gpu.sm_count(), BATCH_ADD_BLOCK_SIZE, 0, gpu[stream_idx]>>>(
+                &d_buckets[nwins << (wbits - 1)], d_current_points, num,
+                &d_digits[0][0], d_hist[0][0]
+            );
+            CUDA_OK(cudaGetLastError());
+            
+            gpu[stream_idx].launch_coop(accumulate<bucket_t, affine_h>,
+                launch_params_t(gpu.sm_count(), ACCUMULATE_NTHREADS),
+                d_buckets, nwins, wbits, d_current_points, d_digits, d_hist, static_cast<uint32_t>(stream_idx)
+            );
+
+            integrate<bucket_t><<<nwins, MSM_NTHREADS,
+                                  sizeof(bucket_t) * MSM_NTHREADS / bucket_t::degree,
+                                  gpu[stream_idx]>>>(
+                d_buckets, nwins, wbits, size_t(143)
+            );
+            CUDA_OK(cudaGetLastError());
+            
+            gpu[stream_idx].DtoH(ones, d_buckets + (nwins << (wbits - 1)));
+            gpu[stream_idx].DtoH(res, d_buckets, sizeof(bucket_h) << (wbits - 1));
+            gpu[stream_idx].record(dtoh_done[stream_idx]);
+            
+            if (i < batch - 1) {
+                d_src_off += stride;
+                num = std::min(static_cast<size_t>(stride), npoints - d_src_off);
+                digits(&d_glv_scalars[d_src_off], num, d_digits, d_temps, mont);
+                gpu[2].record(ev);
+            }
         }
 
+        cudaEventSynchronize(dtoh_done[(batch - 1) & 1]);
         collect(p, res, ones);
         out.add(p);
 
@@ -729,6 +720,7 @@ RustError invoke(point_t& out, const affine_t* points_, size_t npoints_in,
 #endif
     }
 }
+
 
     RustError invoke(point_t& out, vec_t<affine_t> points,
                                    const scalar_t* scalars, bool mont = true,
