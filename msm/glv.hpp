@@ -22,35 +22,43 @@ __device__ __constant__ uint32_t Pallas_b2[8];
 __device__ __constant__ uint32_t beta2[8];
 
 struct GLVHostConstants {
-    static constexpr uint32_t h_g1[8] = {
+    static const uint32_t h_g1[8];
+    static const uint32_t h_g2[8];
+    static const uint32_t h_Pallas_a1[8];
+    static const uint32_t h_Pallas_a2[8];
+    static const uint32_t h_Pallas_b1[8];
+    static const uint32_t h_Pallas_b2[8];
+    static const uint32_t h_beta2[8];
+};
+const uint32_t GLVHostConstants::h_g1[8] = {
         0x111f6861, 0x086862e0, 0xc35fbd4d, 0x00000002,
         0x31f02568, 0x066389a4, 0x4f34e8b2, 0x00000002
     };
-    static constexpr uint32_t h_g2[8] = {
+const uint32_t GLVHostConstants::h_g2[8] = {
         0x4a95a2d9, 0x8480fa55, 0x61afdea6, 0xffffffff,
         0x32c49e4b, 0x02a2654e, 0x279a7459, 0x00000001
     };
-    static constexpr uint32_t h_Pallas_a1[8] = {
+const uint32_t GLVHostConstants::h_Pallas_a1[8] = {
         0x00000001, 0x7fcae1c7, 0x40f04915, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-    static constexpr uint32_t h_Pallas_a2[8] = {
+const uint32_t GLVHostConstants::h_Pallas_a2[8] = {
         0x00000000, 0x8cb12793, 0x40a89953, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-    static constexpr uint32_t h_Pallas_b1[8] = {
+const uint32_t GLVHostConstants::h_Pallas_b1[8] = {
         0x00000000, 0x8cb12793, 0x40a89953, 0x49e69d16,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-    static constexpr uint32_t h_Pallas_b2[8] = {
+const uint32_t GLVHostConstants::h_Pallas_b2[8] = {
         0x00000001, 0x0c7c095a, 0x8198e269, 0x93cd3a2c,
         0x00000000, 0x00000000, 0x00000000, 0x00000000
     };
-    static constexpr uint32_t h_beta2[8] = {
+const uint32_t GLVHostConstants::h_beta2[8] = {
         0x619a153d,0x02021cf6,0x4980b78e,0x9e8c2697,
         0xc87a4666,0x2a676d5c,0xa7a17876,0x15d8049d
     };
-};
+
 
 struct DecomposedScalar {
     uint32_t k[4];
